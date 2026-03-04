@@ -30,13 +30,12 @@ app.get('/', (req, res) => {
 });
 
 // Ruta de prueba para leer el núcleo B2B
+// MODIFICADO: Ahora devuelve la lista directamente para que Retrofit no falle
 app.get('/api/vehicles', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM vehicle_profiles');
-        res.json({
-            success: true,
-            data: result.rows
-        });
+        // Enviamos directamente las filas (rows), que es lo que espera la App en Kotlin
+        res.json(result.rows);
     } catch (error) {
         console.error('Error en la ruta /api/vehicles:', error);
         res.status(500).json({ success: false, error: 'Error interno del servidor' });
