@@ -11,6 +11,13 @@ const port = process.env.PORT || 3000;
 
 const environment = process.env.NODE_ENV || 'development';
 
+// ==========================================
+// CONFIGURACIÓN DE PROXY (Solución Render)
+// ==========================================
+// Esto permite que express-rate-limit identifique 
+// correctamente las IPs de los usuarios tras el proxy de Render.
+app.set('trust proxy', 1);
+
 // 1. ESCUDO RATE LIMITING
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
