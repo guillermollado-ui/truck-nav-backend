@@ -1,7 +1,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
-const crypto = require('crypto'); // NUEVO: Librería nativa de Node para generar IDs únicos
+const crypto = require('crypto'); // Librería nativa de Node para generar IDs únicos
 require('dotenv').config();
 
 const app = express();
@@ -14,7 +14,7 @@ const environment = process.env.NODE_ENV || 'development';
 app.use(cors());
 app.use(express.json());
 
-// NUEVO: Middleware de Logging Estructurado y Correlation ID (El Portero)
+// Middleware de Logging Estructurado y Correlation ID (El Portero)
 app.use((req, res, next) => {
     // Asignamos una "matrícula" única a esta petición (TxID)
     req.correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
@@ -56,30 +56,57 @@ app.get('/', (req, res) => {
 });
 
 // Ruta de prueba para leer el núcleo B2B
-app.get('/api/vehicles', async (req, res) => {
+// MODIFICADO: Añadimos 'next' para delegar los errores al Hospital Central
+app.get('/api/vehicles', async (req, res, next) => {
     const timestamp = new Date().toISOString();
     try {
-        // NUEVO: Logging de seguimiento interno con el mismo TxID
         console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Consultando perfiles de vehículos en base de datos`);
-        
         const result = await pool.query('SELECT * FROM vehicle_profiles');
-        
-        // NUEVO: Confirmación de éxito estructurada
         console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Consulta exitosa. Devolviendo ${result.rowCount} registros`);
         res.json(result.rows);
     } catch (error) {
-        // NUEVO: Logging de error detallado vinculando el TxID
-        console.error(`[${timestamp}] [ERROR] [TxID: ${req.correlationId}] Error en la ruta /api/vehicles:`, error.message);
+        console.error(`[${timestamp}] [ERROR] [TxID: ${req.correlationId}] Error detectado en la BD`);
         
-        // NUEVO: Le damos el correlation_id a la App para facilitar auditorías y soporte
-        res.status(500).json({ 
-            success: false, 
-            error: 'Error interno del servidor',
-            error_code: 'DB_QUERY_FAILED',
-            correlation_id: req.correlationId 
-        });
+        // Etiquetamos el error con nuestro código interno y lo enviamos al manejador global
+        error.statusCode = 500;
+        error.errorCode = 'DB_QUERY_FAILED';
+        next(error); 
     }
 });
+
+// =========================================================================
+// NUEVO DÍA 4: MANEJO GLOBAL DE EXCEPCIONES Y ERRORES ESTANDARIZADOS
+// =========================================================================
+
+// 1. Manejador Global de Rutas (El "Hospital Central" - Debe ir siempre al final de las rutas)
+app.use((err, req, res, next) => {
+    const timestamp = new Date().toISOString();
+    const correlationId = req.correlationId || 'N/A';
+    const statusCode = err.statusCode || 500;
+    const errorCode = err.errorCode || 'INTERNAL_SERVER_ERROR';
+
+    // Logeamos el error real en nuestra consola para poder investigarlo
+    console.error(`[${timestamp}] [FATAL] [TxID: ${correlationId}] Error Global Capturado:`, err.message);
+
+    // Devolvemos una respuesta ESTANDARIZADA a la App móvil
+    res.status(statusCode).json({
+        success: false,
+        // En producción ocultamos detalles técnicos (como fallos de sintaxis SQL) por seguridad
+        error: environment === 'production' ? 'Error interno del servidor. Contacte a soporte.' : err.message,
+        error_code: errorCode,
+        correlation_id: correlationId 
+    });
+});
+
+// 2. Paracaídas de Nivel de Proceso (Evita que el servidor crashee silenciosamente)
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(`[${new Date().toISOString()}] [CRITICAL] Promesa rechazada no manejada:`, reason);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error(`[${new Date().toISOString()}] [CRITICAL] Excepción no capturada:`, err.message);
+});
+// =========================================================================
 
 // Encender el motor del servidor
 app.listen(port, () => {
