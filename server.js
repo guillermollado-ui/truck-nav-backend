@@ -14,12 +14,8 @@ const environment = process.env.NODE_ENV || 'development';
 // ==========================================
 // CONFIGURACIÓN DE PROXY (Solución Render)
 // ==========================================
-// Esto permite que express-rate-limit identifique 
-// correctamente las IPs de los usuarios tras el proxy de Render.
 app.set('trust proxy', 1);
 
-// CORRECCIÓN ARQUITECTÓNICA: CORS y BodyParser deben ir antes del Limiter 
-// para que los errores de Rate Limit incluyan las cabeceras de acceso correcto.
 app.use(cors());
 app.use(express.json());
 
@@ -109,62 +105,70 @@ const authenticateJWT = (req, res, next) => {
 };
 
 // ==========================================
-// NUEVO DÍA 6: VALIDACIÓN ESTRICTA (FAIL-FAST)
+// DÍA 6: VALIDACIÓN ESTRICTA (FAIL-FAST)
 // ==========================================
 const validateVehicleProfile = (req, res, next) => {
     const { height_m, width_m, length_m, weight_t, axles } = req.body;
     const errors = [];
 
-    // Inspección quirúrgica de límites físicos
-    if (height_m === undefined || height_m < 1.0 || height_m > 5.5) errors.push("Altura inválida (Límite: 1.0m a 5.5m)");
-    if (width_m === undefined || width_m < 1.0 || width_m > 3.5) errors.push("Anchura inválida (Límite: 1.0m a 3.5m)");
-    if (length_m === undefined || length_m < 2.0 || length_m > 30.0) errors.push("Longitud inválida (Límite: 2.0m a 30.0m)");
-    if (weight_t === undefined || weight_t < 1.0 || weight_t > 70.0) errors.push("Peso inválido (Límite: 1.0t a 70.0t)");
-    if (axles === undefined || axles < 2 || axles > 12) errors.push("Ejes inválidos (Límite: 2 a 12)");
+    if (height_m === undefined || height_m < 1.0 || height_m > 5.5) errors.push("Altura inválida (1.0m-5.5m)");
+    if (width_m === undefined || width_m < 1.0 || width_m > 3.5) errors.push("Anchura inválida (1.0m-3.5m)");
+    if (length_m === undefined || length_m < 2.0 || length_m > 30.0) errors.push("Longitud inválida (2.0m-30.0m)");
+    if (weight_t === undefined || weight_t < 1.0 || weight_t > 70.0) errors.push("Peso inválido (1.0t-70.0t)");
+    if (axles === undefined || axles < 2 || axles > 12) errors.push("Ejes inválidos (2-12)");
 
     if (errors.length > 0) {
-        console.warn(`[${new Date().toISOString()}] [VALIDATION] [TxID: ${req.correlationId}] Bloqueo de seguridad física: ${errors.join(' | ')}`);
-        return res.status(400).json({ 
-            success: false, 
-            error: 'Los datos del camión violan los límites físicos de seguridad', 
-            details: errors, 
-            error_code: 'PHYSICS_VIOLATION' 
-        });
+        console.warn(`[${new Date().toISOString()}] [VALIDATION] Bloqueo físico: ${errors.join(' | ')}`);
+        return res.status(400).json({ success: false, error: 'Violación de límites físicos', details: errors });
     }
-    
-    // Si la física es correcta, pasamos al siguiente nivel
     next();
 };
 
-// 5. RUTAS PROTEGIDAS B2B (VehicleProfiles)
+// 5. RUTAS PROTEGIDAS B2B
 app.get('/api/vehicles', authenticateJWT, async (req, res, next) => {
-    const timestamp = new Date().toISOString();
     try {
-        console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Consultando perfiles (Usuario autenticado)`);
         const result = await pool.query('SELECT * FROM vehicle_profiles');
         res.json(result.rows);
     } catch (error) {
         error.statusCode = 500;
-        error.errorCode = 'DB_QUERY_FAILED';
         next(error); 
     }
 });
 
-// NUEVA RUTA DÍA 6: Crear o actualizar un vehículo con Validación Estricta
+// ==========================================
+// DÍA 7: SNAPSHOT INMUTABLE (IMPLEMENTACIÓN REAL)
+// ==========================================
 app.post('/api/vehicles', authenticateJWT, validateVehicleProfile, async (req, res, next) => {
+    const { height_m, width_m, length_m, weight_t, axles } = req.body;
     const timestamp = new Date().toISOString();
+    
     try {
-        console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Vehículo validado correctamente. Guardando en DB...`);
-        // Aquí iría el INSERT a la base de datos (PostgreSQL)
-        // Por ahora simulamos el éxito para validar el middleware
+        console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Generando Snapshot Inmutable...`);
+        
+        // Guardamos la "Foto Fija" del vehículo en la tabla inmutable
+        const queryText = `
+            INSERT INTO vehicle_snapshots(height_m, width_m, length_m, weight_t, axles) 
+            VALUES($1, $2, $3, $4, $5) 
+            RETURNING id, created_at
+        `;
+        const values = [height_m, width_m, length_m, weight_t, axles];
+        
+        const result = await pool.query(queryText, values);
+        const snapshot = result.rows[0];
+
+        console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Snapshot guardado con ID: ${snapshot.id}`);
+
         res.status(201).json({
             success: true,
-            message: 'Perfil de vehículo creado y validado con éxito',
+            message: 'Snapshot inmutable generado con éxito',
+            snapshot_id: snapshot.id,
+            timestamp: snapshot.created_at,
             data: req.body
         });
     } catch (error) {
+        console.error(`[${timestamp}] [ERROR] Fallo al guardar snapshot:`, error.message);
         error.statusCode = 500;
-        error.errorCode = 'DB_INSERT_FAILED';
+        error.errorCode = 'SNAPSHOT_FAILED';
         next(error);
     }
 });
@@ -174,26 +178,17 @@ app.use((err, req, res, next) => {
     const timestamp = new Date().toISOString();
     const correlationId = req.correlationId || 'N/A';
     const statusCode = err.statusCode || 500;
-    const errorCode = err.errorCode || 'INTERNAL_SERVER_ERROR';
-
-    console.error(`[${timestamp}] [FATAL] [TxID: ${correlationId}] Error Global Capturado:`, err.message);
 
     res.status(statusCode).json({
         success: false,
-        error: environment === 'production' ? 'Error interno del servidor.' : err.message,
-        error_code: errorCode,
+        error: environment === 'production' ? 'Error interno.' : err.message,
         correlation_id: correlationId 
     });
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-    console.error(`[${new Date().toISOString()}] [CRITICAL] Promesa rechazada no manejada:`, reason);
-});
-process.on('uncaughtException', (err) => {
-    console.error(`[${new Date().toISOString()}] [CRITICAL] Excepción no capturada:`, err.message);
-});
+process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
+process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err.message));
 
 app.listen(port, () => {
-    console.log(`🚀 [INFO] API Gateway B2B corriendo en el puerto ${port}`);
-    console.log(`📡 [INFO] Esperando conexiones en http://localhost:${port}`);
+    console.log(`🚀 API Gateway corriendo en puerto ${port}`);
 });
