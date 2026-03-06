@@ -156,6 +156,38 @@ app.get('/api/vehicles', authenticateJWT, async (req, res, next) => {
     }
 });
 
+// ==========================================
+// NUEVO DÍA 9: VENTANILLA DE INFORMACIÓN DE REGLAS (LOADER)
+// ==========================================
+app.get('/api/rules/:country_code', authenticateJWT, async (req, res, next) => {
+    const countryCode = req.params.country_code.toUpperCase();
+    
+    try {
+        console.log(`[INFO] [TxID: ${req.correlationId}] App solicitando reglas para el país: ${countryCode}`);
+        
+        const result = await pool.query(
+            'SELECT * FROM country_rules WHERE country_code = $1',
+            [countryCode]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({
+                success: false,
+                error: `No tenemos registradas las leyes para el territorio: ${countryCode}`
+            });
+        }
+
+        res.json({
+            success: true,
+            country: countryCode,
+            rules: result.rows[0]
+        });
+    } catch (error) {
+        error.statusCode = 500;
+        next(error);
+    }
+});
+
 // ACTUALIZADA DÍA 8: Crea Snapshot usando reglas dinámicas del país
 app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req, res, next) => {
     const { height_m, width_m, length_m, weight_t, axles, country_code } = req.body;
