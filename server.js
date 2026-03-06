@@ -18,6 +18,11 @@ const environment = process.env.NODE_ENV || 'development';
 // correctamente las IPs de los usuarios tras el proxy de Render.
 app.set('trust proxy', 1);
 
+// CORRECCIÓN ARQUITECTÓNICA: CORS y BodyParser deben ir antes del Limiter 
+// para que los errores de Rate Limit incluyan las cabeceras de acceso correcto.
+app.use(cors());
+app.use(express.json());
+
 // 1. ESCUDO RATE LIMITING
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
@@ -35,9 +40,6 @@ const apiLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-
-app.use(cors());
-app.use(express.json());
 
 // 2. LOGGING ESTRUCTURADO Y CORRELATION ID
 app.use((req, res, next) => {
