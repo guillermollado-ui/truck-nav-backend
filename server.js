@@ -45,8 +45,6 @@ app.use((req, res, next) => {
     next();
 });
 
-console.log(`[INFO] Iniciando TruckNav API Gateway... Entorno: ${environment.toUpperCase()}`);
-
 const poolConfig = { connectionString: process.env.DATABASE_URL };
 if (environment === 'production' || environment === 'staging') {
     poolConfig.ssl = { rejectUnauthorized: false };
@@ -77,11 +75,9 @@ app.post('/api/auth/token', (req, res) => {
             JWT_SECRET,
             { expiresIn: '2h' } 
         );
-        console.log(`[${new Date().toISOString()}] [AUTH] [TxID: ${req.correlationId}] Token JWT generado con éxito`);
         res.json({ success: true, token: token, expires_in: '2h' });
     } else {
-        console.warn(`[${new Date().toISOString()}] [AUTH] [TxID: ${req.correlationId}] Intento de acceso fallido`);
-        res.status(401).json({ success: false, error: 'API Key inválida', error_code: 'INVALID_CREDENTIALS' });
+        res.status(401).json({ success: false, error: 'API Key inválida' });
     }
 });
 
@@ -91,104 +87,115 @@ const authenticateJWT = (req, res, next) => {
     if (authHeader && authHeader.startsWith('Bearer ')) {
         const token = authHeader.split(' ')[1]; 
         jwt.verify(token, JWT_SECRET, (err, decoded) => {
-            if (err) {
-                console.warn(`[${new Date().toISOString()}] [AUTH] [TxID: ${req.correlationId}] Token JWT expirado o inválido`);
-                return res.status(403).json({ success: false, error: 'Token inválido o expirado', error_code: 'TOKEN_INVALID' });
-            }
+            if (err) return res.status(403).json({ success: false, error: 'Token inválido' });
             req.user = decoded;
             next();
         });
     } else {
-        console.warn(`[${new Date().toISOString()}] [AUTH] [TxID: ${req.correlationId}] Petición bloqueada (Sin token)`);
-        res.status(401).json({ success: false, error: 'Autenticación requerida', error_code: 'UNAUTHORIZED' });
+        res.status(401).json({ success: false, error: 'Autenticación requerida' });
     }
 };
 
 // ==========================================
-// DÍA 6: VALIDACIÓN ESTRICTA (FAIL-FAST)
+// DÍA 8: VALIDACIÓN DINÁMICA POR PAÍS
 // ==========================================
-const validateVehicleProfile = (req, res, next) => {
-    const { height_m, width_m, length_m, weight_t, axles } = req.body;
-    const errors = [];
+const validateVehicleByCountry = async (req, res, next) => {
+    const { height_m, weight_t, country_code } = req.body;
+    const targetCountry = country_code || 'ESP'; // Por defecto España si no se envía
 
-    if (height_m === undefined || height_m < 1.0 || height_m > 5.5) errors.push("Altura inválida (1.0m-5.5m)");
-    if (width_m === undefined || width_m < 1.0 || width_m > 3.5) errors.push("Anchura inválida (1.0m-3.5m)");
-    if (length_m === undefined || length_m < 2.0 || length_m > 30.0) errors.push("Longitud inválida (2.0m-30.0m)");
-    if (weight_t === undefined || weight_t < 1.0 || weight_t > 70.0) errors.push("Peso inválido (1.0t-70.0t)");
-    if (axles === undefined || axles < 2 || axles > 12) errors.push("Ejes inválidos (2-12)");
+    try {
+        // Consultamos las reglas vigentes para ese país en la DB
+        const ruleResult = await pool.query(
+            'SELECT * FROM country_rules WHERE country_code = $1', 
+            [targetCountry]
+        );
 
-    if (errors.length > 0) {
-        console.warn(`[${new Date().toISOString()}] [VALIDATION] Bloqueo físico: ${errors.join(' | ')}`);
-        return res.status(400).json({ success: false, error: 'Violación de límites físicos', details: errors });
+        if (ruleResult.rowCount === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                error: `No hay reglas configuradas para el país: ${targetCountry}` 
+            });
+        }
+
+        const rules = ruleResult.rows[0];
+        const errors = [];
+
+        // Validación dinámica contra la base de datos
+        if (height_m > rules.max_height_m) {
+            errors.push(`Altura excede el límite de ${rules.country_name} (${rules.max_height_m}m)`);
+        }
+        if (weight_t > rules.max_weight_t) {
+            errors.push(`Peso excede el límite de ${rules.country_name} (${rules.max_weight_t}t)`);
+        }
+
+        if (errors.length > 0) {
+            console.warn(`[VALIDATION] Bloqueo en ${targetCountry}: ${errors.join(' | ')}`);
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Violación de leyes de transporte locales', 
+                details: errors,
+                country: rules.country_name
+            });
+        }
+
+        // Guardamos las reglas en el objeto request por si las necesitamos después
+        req.countryRules = rules;
+        next();
+    } catch (error) {
+        next(error);
     }
-    next();
 };
 
-// 5. RUTAS PROTEGIDAS B2B
+// 5. RUTAS PROTEGIDAS
 app.get('/api/vehicles', authenticateJWT, async (req, res, next) => {
     try {
         const result = await pool.query('SELECT * FROM vehicle_profiles');
         res.json(result.rows);
     } catch (error) {
-        error.statusCode = 500;
         next(error); 
     }
 });
 
-// ==========================================
-// DÍA 7: SNAPSHOT INMUTABLE (IMPLEMENTACIÓN REAL)
-// ==========================================
-app.post('/api/vehicles', authenticateJWT, validateVehicleProfile, async (req, res, next) => {
-    const { height_m, width_m, length_m, weight_t, axles } = req.body;
-    const timestamp = new Date().toISOString();
+// ACTUALIZADA DÍA 8: Crea Snapshot usando reglas dinámicas del país
+app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req, res, next) => {
+    const { height_m, width_m, length_m, weight_t, axles, country_code } = req.body;
     
     try {
-        console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Generando Snapshot Inmutable...`);
-        
-        // Guardamos la "Foto Fija" del vehículo en la tabla inmutable
         const queryText = `
             INSERT INTO vehicle_snapshots(height_m, width_m, length_m, weight_t, axles) 
             VALUES($1, $2, $3, $4, $5) 
             RETURNING id, created_at
         `;
-        const values = [height_m, width_m, length_m, weight_t, axles];
+        const values = [height_m, width_m || 2.5, length_m || 12.0, weight_t, axles || 2];
         
         const result = await pool.query(queryText, values);
         const snapshot = result.rows[0];
 
-        console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Snapshot guardado con ID: ${snapshot.id}`);
-
         res.status(201).json({
             success: true,
-            message: 'Snapshot inmutable generado con éxito',
+            message: `Snapshot validado según leyes de ${req.countryRules.country_name}`,
             snapshot_id: snapshot.id,
-            timestamp: snapshot.created_at,
-            data: req.body
+            applied_limits: {
+                max_h: req.countryRules.max_height_m,
+                max_w: req.countryRules.max_weight_t
+            }
         });
     } catch (error) {
-        console.error(`[${timestamp}] [ERROR] Fallo al guardar snapshot:`, error.message);
         error.statusCode = 500;
-        error.errorCode = 'SNAPSHOT_FAILED';
         next(error);
     }
 });
 
 // 6. MANEJO GLOBAL DE EXCEPCIONES
 app.use((err, req, res, next) => {
-    const timestamp = new Date().toISOString();
-    const correlationId = req.correlationId || 'N/A';
     const statusCode = err.statusCode || 500;
-
     res.status(statusCode).json({
         success: false,
         error: environment === 'production' ? 'Error interno.' : err.message,
-        correlation_id: correlationId 
+        correlation_id: req.correlationId || 'N/A'
     });
 });
 
-process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
-process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err.message));
-
 app.listen(port, () => {
-    console.log(`🚀 API Gateway corriendo en puerto ${port}`);
+    console.log(`🚀 API Gateway con Reglas Dinámicas en puerto ${port}`);
 });
