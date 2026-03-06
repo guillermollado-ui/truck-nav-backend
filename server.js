@@ -108,19 +108,64 @@ const authenticateJWT = (req, res, next) => {
     }
 };
 
-// 5. RUTA PROTEGIDA B2B
+// ==========================================
+// NUEVO DÍA 6: VALIDACIÓN ESTRICTA (FAIL-FAST)
+// ==========================================
+const validateVehicleProfile = (req, res, next) => {
+    const { height_m, width_m, length_m, weight_t, axles } = req.body;
+    const errors = [];
+
+    // Inspección quirúrgica de límites físicos
+    if (height_m === undefined || height_m < 1.0 || height_m > 5.5) errors.push("Altura inválida (Límite: 1.0m a 5.5m)");
+    if (width_m === undefined || width_m < 1.0 || width_m > 3.5) errors.push("Anchura inválida (Límite: 1.0m a 3.5m)");
+    if (length_m === undefined || length_m < 2.0 || length_m > 30.0) errors.push("Longitud inválida (Límite: 2.0m a 30.0m)");
+    if (weight_t === undefined || weight_t < 1.0 || weight_t > 70.0) errors.push("Peso inválido (Límite: 1.0t a 70.0t)");
+    if (axles === undefined || axles < 2 || axles > 12) errors.push("Ejes inválidos (Límite: 2 a 12)");
+
+    if (errors.length > 0) {
+        console.warn(`[${new Date().toISOString()}] [VALIDATION] [TxID: ${req.correlationId}] Bloqueo de seguridad física: ${errors.join(' | ')}`);
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Los datos del camión violan los límites físicos de seguridad', 
+            details: errors, 
+            error_code: 'PHYSICS_VIOLATION' 
+        });
+    }
+    
+    // Si la física es correcta, pasamos al siguiente nivel
+    next();
+};
+
+// 5. RUTAS PROTEGIDAS B2B (VehicleProfiles)
 app.get('/api/vehicles', authenticateJWT, async (req, res, next) => {
     const timestamp = new Date().toISOString();
     try {
         console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Consultando perfiles (Usuario autenticado)`);
         const result = await pool.query('SELECT * FROM vehicle_profiles');
-        console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Consulta exitosa. Devolviendo ${result.rowCount} registros`);
         res.json(result.rows);
     } catch (error) {
-        console.error(`[${timestamp}] [ERROR] [TxID: ${req.correlationId}] Error detectado en la BD`);
         error.statusCode = 500;
         error.errorCode = 'DB_QUERY_FAILED';
         next(error); 
+    }
+});
+
+// NUEVA RUTA DÍA 6: Crear o actualizar un vehículo con Validación Estricta
+app.post('/api/vehicles', authenticateJWT, validateVehicleProfile, async (req, res, next) => {
+    const timestamp = new Date().toISOString();
+    try {
+        console.log(`[${timestamp}] [INFO] [TxID: ${req.correlationId}] Vehículo validado correctamente. Guardando en DB...`);
+        // Aquí iría el INSERT a la base de datos (PostgreSQL)
+        // Por ahora simulamos el éxito para validar el middleware
+        res.status(201).json({
+            success: true,
+            message: 'Perfil de vehículo creado y validado con éxito',
+            data: req.body
+        });
+    } catch (error) {
+        error.statusCode = 500;
+        error.errorCode = 'DB_INSERT_FAILED';
+        next(error);
     }
 });
 
