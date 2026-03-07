@@ -257,11 +257,10 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
 });
 
 // ==========================================
-// DÍA 12 Y 13: ENDPOINT PARA ENRUTAMIENTO Y GUARDADO EN CACHÉ (JSONB)
+// DÍA 12, 13 Y 14: ENDPOINT PARA ENRUTAMIENTO, CACHÉ Y SEGMENTACIÓN
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const { origin, destination } = req.body;
-    // Ejemplos esperados: origin="52.5308,13.3847" destination="52.5264,13.3686"
 
     if (!origin || !destination) {
         return res.status(400).json({ success: false, error: 'Se requieren origen y destino.' });
@@ -281,15 +280,45 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
+        // DÍA 14: DIVIDIR RUTA EN SEGMENTOS REALES
+        console.log(`[INFO] [TxID: ${req.correlationId}] Troceando ruta en segmentos...`);
+        let segmentosGuardados = 0;
+        
+        // HERE divide las rutas en "sections" (tramos)
+        if (routeData.routes && routeData.routes.length > 0) {
+            const sections = routeData.routes[0].sections;
+            
+            for (let i = 0; i < sections.length; i++) {
+                const section = sections[i];
+                
+                // Extraemos de forma segura el inicio, el final, la longitud y el tiempo del tramo
+                const startCoords = section.departure?.place?.location 
+                    ? `${section.departure.place.location.lat},${section.departure.place.location.lng}` 
+                    : origin;
+                const endCoords = section.arrival?.place?.location 
+                    ? `${section.arrival.place.location.lat},${section.arrival.place.location.lng}` 
+                    : destination;
+                const lengthMeters = section.summary?.length || 0;
+                const durationSeconds = section.summary?.duration || 0;
+
+                const segmentQuery = `
+                    INSERT INTO route_segments (response_id, segment_index, start_coords, end_coords, length_meters, duration_seconds)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                `;
+                await pool.query(segmentQuery, [savedId, i + 1, startCoords, endCoords, lengthMeters, durationSeconds]);
+                segmentosGuardados++;
+            }
+        }
+        
         res.json({
             success: true,
-            message: 'Ruta calculada y guardada con éxito en caché.',
-            saved_response_id: savedId, // Devolvemos el ID generado por la BD para comprobar que funcionó
+            message: 'Ruta calculada, guardada en caché y dividida en segmentos con éxito.',
+            saved_response_id: savedId,
+            segments_created: segmentosGuardados,
             data: routeData
         });
     } catch (error) {
-        // Si el error viene de axios, pasamos el status de la respuesta de HERE si existe
-        error.statusCode = error.response ? error.response.status : 503; // 503 Service Unavailable si falló la red
+        error.statusCode = error.response ? error.response.status : 503;
         next(error);
     }
 });
@@ -305,5 +334,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway con Reglas Dinámicas y Rutas en Caché (Día 13) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B con Segmentación (Día 14) en puerto ${port}`);
 });
