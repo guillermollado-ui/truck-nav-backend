@@ -257,7 +257,7 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
 });
 
 // ==========================================
-// NUEVO ENDPOINT PARA ENRUTAMIENTO (Usa la lógica del Día 12)
+// DÍA 12 Y 13: ENDPOINT PARA ENRUTAMIENTO Y GUARDADO EN CACHÉ (JSONB)
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const { origin, destination } = req.body;
@@ -271,9 +271,20 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta robusta de ${origin} a ${destination}`);
         const routeData = await fetchRouteFromHEREWithRetry(origin, destination);
         
+        // DÍA 13: GUARDAR RESPUESTA COMPLETA DEL PROVEEDOR
+        console.log(`[INFO] [TxID: ${req.correlationId}] Guardando respuesta cruda de HERE en la base de datos...`);
+        const insertQuery = `
+            INSERT INTO provider_responses (origin_coords, destination_coords, raw_data)
+            VALUES ($1, $2, $3)
+            RETURNING id
+        `;
+        const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
+        const savedId = dbResult.rows[0].id;
+        
         res.json({
             success: true,
-            message: 'Ruta calculada con éxito desde HERE.',
+            message: 'Ruta calculada y guardada con éxito en caché.',
+            saved_response_id: savedId, // Devolvemos el ID generado por la BD para comprobar que funcionó
             data: routeData
         });
     } catch (error) {
@@ -294,5 +305,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway con Reglas Dinámicas y Rutas (Día 12) en puerto ${port}`);
+    console.log(`🚀 API Gateway con Reglas Dinámicas y Rutas en Caché (Día 13) en puerto ${port}`);
 });
