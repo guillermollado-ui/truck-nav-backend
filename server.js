@@ -4,6 +4,8 @@ const cors = require('cors');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
+// AÑADIDO: Axios para las peticiones a HERE
+const axios = require('axios'); 
 require('dotenv').config();
 
 const app = express();
@@ -146,6 +148,42 @@ const validateVehicleByCountry = async (req, res, next) => {
     }
 };
 
+// ==========================================
+// DÍA 12: MANEJO ROBUSTO Y REINTENTOS EXPONENCIALES PARA HERE API
+// ==========================================
+/**
+ * Llama a la API de HERE con reintentos exponenciales en caso de fallos de red o errores 5xx.
+ * No reintenta en errores de cliente (4xx) porque significa que la petición está mal formada.
+ */
+const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, delay = 1000) => {
+    const apiKey = process.env.HERE_API_KEY;
+    if (!apiKey) {
+        throw new Error('HERE_API_KEY no configurada en el servidor.');
+    }
+
+    const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary&apikey=${apiKey}`;
+
+    try {
+        const response = await axios.get(url);
+        return response.data;
+    } catch (error) {
+        const isNetworkError = !error.response; // Fallo de DNS, timeout, etc.
+        const isServerError = error.response && error.response.status >= 500; // HERE está caído
+
+        if ((isNetworkError || isServerError) && retries > 0) {
+            console.warn(`⚠️ [HERE API] Fallo en la llamada. Reintentando en ${delay}ms... (Quedan ${retries} intentos)`);
+            // Espera asíncrona (delay)
+            await new Promise(resolve => setTimeout(resolve, delay));
+            // Llamada recursiva multiplicando el delay (exponencial: 1s, 2s, 4s...)
+            return fetchRouteFromHEREWithRetry(origin, destination, retries - 1, delay * 2);
+        } else {
+            // Si no quedan reintentos o es un error 400 (ej. parámetros inválidos), lanza el error definitivo
+            console.error(`❌ [HERE API] Error definitivo tras reintentos o error de cliente:`, error.message);
+            throw error;
+        }
+    }
+};
+
 // 5. RUTAS PROTEGIDAS
 app.get('/api/vehicles', authenticateJWT, async (req, res, next) => {
     try {
@@ -218,6 +256,33 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
     }
 });
 
+// ==========================================
+// NUEVO ENDPOINT PARA ENRUTAMIENTO (Usa la lógica del Día 12)
+// ==========================================
+app.post('/api/route', authenticateJWT, async (req, res, next) => {
+    const { origin, destination } = req.body;
+    // Ejemplos esperados: origin="52.5308,13.3847" destination="52.5264,13.3686"
+
+    if (!origin || !destination) {
+        return res.status(400).json({ success: false, error: 'Se requieren origen y destino.' });
+    }
+
+    try {
+        console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta robusta de ${origin} a ${destination}`);
+        const routeData = await fetchRouteFromHEREWithRetry(origin, destination);
+        
+        res.json({
+            success: true,
+            message: 'Ruta calculada con éxito desde HERE.',
+            data: routeData
+        });
+    } catch (error) {
+        // Si el error viene de axios, pasamos el status de la respuesta de HERE si existe
+        error.statusCode = error.response ? error.response.status : 503; // 503 Service Unavailable si falló la red
+        next(error);
+    }
+});
+
 // 6. MANEJO GLOBAL DE EXCEPCIONES
 app.use((err, req, res, next) => {
     const statusCode = err.statusCode || 500;
@@ -229,5 +294,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway con Reglas Dinámicas en puerto ${port}`);
+    console.log(`🚀 API Gateway con Reglas Dinámicas y Rutas (Día 12) en puerto ${port}`);
 });
