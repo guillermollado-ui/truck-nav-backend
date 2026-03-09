@@ -277,7 +277,7 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
 });
 
 // ==========================================
-// DÍA 16 - 20: RIESGO PROGRESIVO Y PONDERACIÓN FINAL DE LA RUTA
+// DÍA 16 - 22: RIESGO PROGRESIVO, PONDERACIÓN FINAL Y DETECCIÓN URBANA
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const { origin, destination, height_m, weight_t } = req.body;
@@ -300,12 +300,15 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
-        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando riesgos ponderados por distancia (Día 20)...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando riesgos físicos y densidad urbana (Día 22)...`);
         let segmentosGuardados = 0;
         
         // DÍA 20: Variables para acumular la ponderación
         let totalRiskWeighted = 0;
         let totalRouteLength = 0;
+
+        // Bandera para saber si toda la ruta tocó alguna zona densa
+        let routeTouchesUrban = false; 
 
         if (routeData.routes && routeData.routes.length > 0) {
             const sections = routeData.routes[0].sections;
@@ -321,6 +324,13 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                     : destination;
                 const lengthMeters = section.summary?.length || 0;
                 const durationSeconds = section.summary?.duration || 0;
+
+                // --- DÍA 22: RADAR DE ZONA URBANA DENSA ---
+                // Calculamos la velocidad media en metros por segundo
+                const speedMps = durationSeconds > 0 ? (lengthMeters / durationSeconds) : 0;
+                // Si la velocidad es menor a 13.88 m/s (50 km/h) y se mueve, asumimos tráfico denso/urbano
+                const isUrbanDense = (speedMps > 0 && speedMps < 13.88);
+                if (isUrbanDense) routeTouchesUrban = true;
 
                 // --- 1. RIESGO PROGRESIVO DE ALTURA ---
                 let segmentHeightLimit = 5.0; 
@@ -364,17 +374,19 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const physicalRiskScore = Math.max(heightRiskScore, weightRiskScore);
                 const totalSegmentScore = physicalRiskScore;
 
-                // --- 4. DÍA 20: ACUMULACIÓN PARA LA PONDERACIÓN ---
+                // --- 4. ACUMULACIÓN PARA LA PONDERACIÓN ---
                 totalRouteLength += lengthMeters;
                 totalRiskWeighted += (totalSegmentScore * lengthMeters);
 
+                // Insertamos el segmento con el nuevo interruptor (is_urban_dense)
                 const segmentQuery = `
                     INSERT INTO route_segments (
                         response_id, segment_index, start_coords, end_coords, 
                         length_meters, duration_seconds, height_margin_m, 
-                        physical_risk_score, weight_margin_t, total_segment_score
+                        physical_risk_score, weight_margin_t, total_segment_score,
+                        is_urban_dense
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 `;
                 await pool.query(segmentQuery, [
                     savedId, 
@@ -386,13 +398,14 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                     heightMargin, 
                     physicalRiskScore,
                     weightMargin,
-                    totalSegmentScore
+                    totalSegmentScore,
+                    isUrbanDense // ¡La detección del Día 22 en acción!
                 ]);
                 segmentosGuardados++;
             }
         }
 
-        // --- DÍA 20: CÁLCULO FINAL DE LA RUTA Y ACTUALIZACIÓN EN BÓVEDA ---
+        // --- CÁLCULO FINAL DE LA RUTA Y ACTUALIZACIÓN EN BÓVEDA ---
         const finalRouteRisk = totalRouteLength > 0 ? Math.round(totalRiskWeighted / totalRouteLength) : 0;
 
         const updateRouteQuery = `
@@ -404,14 +417,11 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         
         res.json({
             success: true,
-            message: 'Ruta calculada y riesgo total ponderado guardado con éxito (Día 20).',
+            message: 'Ruta calculada con detección urbana (Día 22).',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             final_route_risk: finalRouteRisk,
-            applied_physics: {
-                height_m: truckHeight,
-                weight_t: truckWeight
-            },
+            urban_zone_detected: routeTouchesUrban,
             data: routeData
         });
     } catch (error) {
@@ -431,5 +441,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Zonas Ambientales (Día 21) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Radar Urbano Activo (Día 22) en puerto ${port}`);
 });
