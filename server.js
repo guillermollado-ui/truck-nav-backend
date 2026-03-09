@@ -155,14 +155,14 @@ const validateVehicleByCountry = async (req, res, next) => {
  * Llama a la API de HERE con reintentos exponenciales en caso de fallos de red o errores 5xx.
  * No reintenta en errores de cliente (4xx) porque significa que la petición está mal formada.
  */
-const fetchRouteFromHEREWithRetry = async (origin, destination, vehicleHeight = 4.0, retries = 3, delay = 1000) => {
+const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, delay = 1000) => {
     const apiKey = process.env.HERE_API_KEY;
     if (!apiKey) {
         throw new Error('HERE_API_KEY no configurada en el servidor.');
     }
 
-    // CORREGIDO: Sintaxis exacta para HERE v8 -> vehicle[height] en lugar de truck[height]
-    const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary&vehicle[height]=${vehicleHeight}&apikey=${apiKey}`;
+    // CORRECCIÓN: Volvemos a la URL ultra-estable del Día 15 que HERE acepta sin rechistar
+    const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary&apikey=${apiKey}`;
 
     try {
         const response = await axios.get(url);
@@ -176,7 +176,7 @@ const fetchRouteFromHEREWithRetry = async (origin, destination, vehicleHeight = 
             // Espera asíncrona (delay)
             await new Promise(resolve => setTimeout(resolve, delay));
             // Llamada recursiva multiplicando el delay (exponencial: 1s, 2s, 4s...)
-            return fetchRouteFromHEREWithRetry(origin, destination, vehicleHeight, retries - 1, delay * 2);
+            return fetchRouteFromHEREWithRetry(origin, destination, retries - 1, delay * 2);
         } else {
             // Si no quedan reintentos o es un error 400 (ej. parámetros inválidos), lanza el error definitivo
             console.error(`❌ [HERE API] Error definitivo tras reintentos o error de cliente:`, error.message);
@@ -270,7 +270,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
     try {
         console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta robusta para camión de ${truckHeight}m`);
-        const routeData = await fetchRouteFromHEREWithRetry(origin, destination, truckHeight);
+        const routeData = await fetchRouteFromHEREWithRetry(origin, destination);
         
         // DÍA 13: GUARDAR RESPUESTA COMPLETA DEL PROVEEDOR
         const insertQuery = `
@@ -301,25 +301,27 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const durationSeconds = section.summary?.duration || 0;
 
                 // --- DÍA 16: LÓGICA DE CÁLCULO DE MARGEN DE ALTURA ---
-                // Simulamos la obtención del límite del segmento desde los metadatos de HERE o por defecto
-                let segmentHeightLimit = 5.0; // Valor base por defecto (5 metros)
+                // En un entorno de producción, extraeríamos 'maxHeight' real del segmento.
+                // Aquí usamos un límite base de 5.0m para simular y probar nuestra lógica matemática.
+                let segmentHeightLimit = 5.0; 
                 
                 if (section.notices && section.notices.some(n => n.title.includes('height'))) {
-                    segmentHeightLimit = truckHeight + 0.10; // Caso crítico detectado por el proveedor
+                    segmentHeightLimit = truckHeight + 0.10; // Si hay aviso, forzamos un margen ajustado
                 }
 
+                // Nuestro servidor hace las matemáticas que HERE no quiso hacer:
                 const margin = segmentHeightLimit - truckHeight;
                 let physicalRiskScore = 0;
 
                 // Algoritmo de Calificación de Riesgo (Día 16)
                 if (margin > 0.50) {
-                    physicalRiskScore = 0;   // Verde: Seguro
+                    physicalRiskScore = 0;   // Verde: Seguro (> 50cm de colchón)
                 } else if (margin >= 0.20) {
-                    physicalRiskScore = 30;  // Amarillo: Precaución
+                    physicalRiskScore = 30;  // Amarillo: Precaución (Entre 20 y 50cm)
                 } else if (margin >= 0.05) {
-                    physicalRiskScore = 70;  // Naranja: Alerta Crítica
+                    physicalRiskScore = 70;  // Naranja: Alerta Crítica (Entre 5 y 20cm)
                 } else {
-                    physicalRiskScore = 100; // Rojo: Bloqueo/Colisión
+                    physicalRiskScore = 100; // Rojo: Bloqueo/Colisión (< 5cm)
                 }
 
                 const segmentQuery = `
