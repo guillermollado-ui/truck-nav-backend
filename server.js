@@ -220,6 +220,32 @@ app.get('/api/rules/:country_code', authenticateJWT, async (req, res, next) => {
     }
 });
 
+// ==========================================
+// DÍA 21: LECTURA DE ZONAS AMBIENTALES (ZBE)
+// ==========================================
+app.get('/api/zones/:country_code', authenticateJWT, async (req, res, next) => {
+    const countryCode = req.params.country_code.toUpperCase();
+    
+    try {
+        console.log(`[INFO] [TxID: ${req.correlationId}] App solicitando zonas ambientales para el país: ${countryCode}`);
+        
+        const result = await pool.query(
+            'SELECT * FROM environmental_zones WHERE country_code = $1',
+            [countryCode]
+        );
+
+        res.json({
+            success: true,
+            country: countryCode,
+            total_zones: result.rowCount,
+            zones: result.rows
+        });
+    } catch (error) {
+        error.statusCode = 500;
+        next(error);
+    }
+});
+
 // ACTUALIZADA DÍA 8: Crea Snapshot usando reglas dinámicas del país
 app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req, res, next) => {
     const { height_m, width_m, length_m, weight_t, axles, country_code } = req.body;
@@ -405,5 +431,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Riesgo Ponderado Final (Día 20) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Zonas Ambientales (Día 21) en puerto ${port}`);
 });
