@@ -277,22 +277,24 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
 });
 
 // ==========================================
-// DÍA 16 - 23: RIESGO PROGRESIVO, DETECCIÓN URBANA Y MULTAS ZBE
+// DÍA 16 - 24: RIESGOS FÍSICOS, AMBIENTALES Y RESTRICCIONES HORARIAS
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
-    // DÍA 23: Extraemos el estándar Euro del motor y el país para la ZBE
-    const { origin, destination, height_m, weight_t, euro_standard, country_code } = req.body;
+    // DÍA 24: Añadimos la lectura de la hora de salida (departure_time)
+    const { origin, destination, height_m, weight_t, euro_standard, country_code, departure_time } = req.body;
     const truckHeight = height_m || 4.0; 
     const truckWeight = weight_t || 40.0; 
-    const truckEuro = euro_standard || 6; // Por defecto asumimos el motor más limpio (Euro 6)
-    const targetCountry = country_code || 'DEU'; // Para nuestra prueba en Berlín, asumimos DEU
+    const truckEuro = euro_standard || 6; 
+    const targetCountry = country_code || 'DEU'; 
+    // Si no manda hora, asumimos el momento exacto en que lanza la petición
+    const startTime = departure_time ? new Date(departure_time) : new Date();
 
     if (!origin || !destination) {
         return res.status(400).json({ success: false, error: 'Se requieren origen y destino.' });
     }
 
     try {
-        console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta para camión (H: ${truckHeight}m, W: ${truckWeight}t, Euro: ${truckEuro})`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta con reloj activo. Salida: ${startTime.toISOString()}`);
         const routeData = await fetchRouteFromHEREWithRetry(origin, destination);
         
         const insertQuery = `
@@ -303,15 +305,12 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
-        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando Zonas Ambientales (Día 23)...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando Zonas Ambientales y Restricciones de Reloj (Día 24)...`);
         
-        // --- DÍA 23: PRECARGA DE LEYES AMBIENTALES ---
-        // Consultamos qué pide la ZBE más estricta de este país
         const zoneResult = await pool.query('SELECT * FROM environmental_zones WHERE country_code = $1', [targetCountry]);
         const activeZones = zoneResult.rows;
         let requiredEuro = 0;
         if (activeZones.length > 0) {
-            // Buscamos la exigencia más alta para protegernos en el peor escenario
             requiredEuro = Math.max(...activeZones.map(z => z.min_euro_standard));
         }
 
@@ -320,6 +319,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         let totalRouteLength = 0;
         let routeTouchesUrban = false; 
         let environmentalAlert = false;
+        let timeAlert = false; // Nueva bandera del Día 24
+        
+        let accumulatedDurationSeconds = 0; // El cronómetro interno del viaje
 
         if (routeData.routes && routeData.routes.length > 0) {
             const sections = routeData.routes[0].sections;
@@ -336,12 +338,17 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const lengthMeters = section.summary?.length || 0;
                 const durationSeconds = section.summary?.duration || 0;
 
-                // --- RADAR DE ZONA URBANA DENSA (Día 22) ---
+                // Sumamos el tiempo de viaje hasta llegar a este tramo
+                accumulatedDurationSeconds += durationSeconds;
+                const segmentTime = new Date(startTime.getTime() + (accumulatedDurationSeconds * 1000));
+                const segmentHour = segmentTime.getHours();
+
+                // --- RADAR URBANO (Día 22) ---
                 const speedMps = durationSeconds > 0 ? (lengthMeters / durationSeconds) : 0;
                 const isUrbanDense = (speedMps > 0 && speedMps < 13.88);
                 if (isUrbanDense) routeTouchesUrban = true;
 
-                // --- 1. RIESGO PROGRESIVO DE ALTURA ---
+                // --- 1. RIESGO DE ALTURA ---
                 let segmentHeightLimit = 5.0; 
                 if (section.notices && section.notices.some(n => n.title.includes('height'))) {
                     segmentHeightLimit = truckHeight + 0.10; 
@@ -352,7 +359,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 else if (heightMargin <= 0.05) heightRiskScore = 100;
                 else heightRiskScore = Math.round(((0.50 - heightMargin) / (0.50 - 0.05)) * 100);
 
-                // --- 2. RIESGO PROGRESIVO DE PESO ---
+                // --- 2. RIESGO DE PESO ---
                 let segmentWeightLimit = 44.0;
                 if (section.notices && section.notices.some(n => n.title.includes('weight'))) {
                     segmentWeightLimit = truckWeight + 0.5;
@@ -363,38 +370,43 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 else if (weightMargin <= 0.5) weightRiskScore = 100;
                 else weightRiskScore = Math.round(((5.0 - weightMargin) / (5.0 - 0.5)) * 100);
 
-                // --- 3. RIESGO AMBIENTAL Y MULTAS ZBE (DÍA 23) ---
+                // --- 3. RIESGO AMBIENTAL (ZBE) ---
                 let environmentalRiskScore = 0;
-                // Si estamos en la ciudad y hay una ley ambiental activa...
                 if (isUrbanDense && requiredEuro > 0) {
                     if (truckEuro < requiredEuro) {
-                        environmentalRiskScore = 100; // ¡Multa segura! El motor es demasiado viejo
+                        environmentalRiskScore = 100; 
                         environmentalAlert = true;
                     } else if (truckEuro === requiredEuro) {
-                        environmentalRiskScore = 30;  // Pasa por los pelos
-                    } else {
-                        environmentalRiskScore = 0;   // Motor limpio y seguro
+                        environmentalRiskScore = 30;  
                     }
                 }
 
-                // --- 4. VEREDICTO FINAL: PRINCIPIO DE MÁXIMO PELIGRO ---
-                const physicalRiskScore = Math.max(heightRiskScore, weightRiskScore);
-                // El score total ahora tiene en cuenta tanto que no choques como que no te multen
-                const totalSegmentScore = Math.max(physicalRiskScore, environmentalRiskScore);
+                // --- 4. RESTRICCIONES HORARIAS (DÍA 24) ---
+                let timeRestrictionRiskScore = 0;
+                // Simulamos la restricción: Prohibido camiones en zona urbana densa de 22:00 a 06:00
+                if (isUrbanDense && (segmentHour >= 22 || segmentHour < 6)) {
+                    timeRestrictionRiskScore = 100;
+                    timeAlert = true;
+                }
 
-                // --- 5. ACUMULACIÓN PARA LA PONDERACIÓN ---
+                // --- 5. VEREDICTO FINAL: PRINCIPIO DE MÁXIMO PELIGRO ---
+                // Ahora enfrentamos al camión contra los 4 jinetes: altura, peso, contaminación y reloj
+                const physicalRiskScore = Math.max(heightRiskScore, weightRiskScore);
+                const contextualRiskScore = Math.max(environmentalRiskScore, timeRestrictionRiskScore);
+                const totalSegmentScore = Math.max(physicalRiskScore, contextualRiskScore);
+
+                // --- ACUMULACIÓN PARA LA PONDERACIÓN ---
                 totalRouteLength += lengthMeters;
                 totalRiskWeighted += (totalSegmentScore * lengthMeters);
 
-                // Insertamos en la Bóveda con la nueva columna ambiental
                 const segmentQuery = `
                     INSERT INTO route_segments (
                         response_id, segment_index, start_coords, end_coords, 
                         length_meters, duration_seconds, height_margin_m, 
                         physical_risk_score, weight_margin_t, total_segment_score,
-                        is_urban_dense, environmental_risk_score
+                        is_urban_dense, environmental_risk_score, time_restriction_risk_score
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 `;
                 await pool.query(segmentQuery, [
                     savedId, 
@@ -408,13 +420,13 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                     weightMargin,
                     totalSegmentScore,
                     isUrbanDense,
-                    environmentalRiskScore // El dato fresco del Día 23
+                    environmentalRiskScore,
+                    timeRestrictionRiskScore // El guardián del tiempo del Día 24
                 ]);
                 segmentosGuardados++;
             }
         }
 
-        // --- CÁLCULO FINAL DE LA RUTA Y ACTUALIZACIÓN EN BÓVEDA ---
         const finalRouteRisk = totalRouteLength > 0 ? Math.round(totalRiskWeighted / totalRouteLength) : 0;
 
         const updateRouteQuery = `
@@ -426,15 +438,18 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         
         res.json({
             success: true,
-            message: 'Ruta calculada con análisis físico y ambiental (ZBE) completado (Día 23).',
+            message: 'Ruta calculada con análisis total de la matriz de riesgos (Día 24).',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             final_route_risk: finalRouteRisk,
-            urban_zone_detected: routeTouchesUrban,
-            environmental_alert: environmentalAlert,
+            alerts: {
+                urban_zone: routeTouchesUrban,
+                environmental_multa: environmentalAlert,
+                time_restriction: timeAlert // Aviso de horario para la app
+            },
             applied_context: {
                 euro_standard: truckEuro,
-                required_euro: requiredEuro
+                departure_time: startTime.toISOString()
             },
             data: routeData
         });
@@ -455,5 +470,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Riesgo Ambiental Activo (Día 23) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Reloj Biológico Activo (Día 24) en puerto ${port}`);
 });
