@@ -251,13 +251,12 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
 });
 
 // ==========================================
-// DÍA 16 Y 17: MOTOR DE RIESGO FÍSICO COMPLETO (ALTURA + PESO)
+// DÍA 16, 17 Y 18: RIESGO FÍSICO CON PENALIZACIÓN PROGRESIVA
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
-    // Día 17: Añadimos la lectura del peso del camión (weight_t)
     const { origin, destination, height_m, weight_t } = req.body;
-    const truckHeight = height_m || 4.0; // 4 metros por defecto
-    const truckWeight = weight_t || 40.0; // 40 toneladas por defecto
+    const truckHeight = height_m || 4.0; 
+    const truckWeight = weight_t || 40.0; 
 
     if (!origin || !destination) {
         return res.status(400).json({ success: false, error: 'Se requieren origen y destino.' });
@@ -267,7 +266,6 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta para camión (H: ${truckHeight}m, W: ${truckWeight}t)`);
         const routeData = await fetchRouteFromHEREWithRetry(origin, destination);
         
-        // Guardar la respuesta bruta (Día 13)
         const insertQuery = `
             INSERT INTO provider_responses (origin_coords, destination_coords, raw_data)
             VALUES ($1, $2, $3)
@@ -276,8 +274,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
-        // Procesamiento de Segmentos y Riesgos Físicos
-        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando riesgos físicos completos (Altura y Peso)...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando penalización progresiva (Día 18)...`);
         let segmentosGuardados = 0;
         
         if (routeData.routes && routeData.routes.length > 0) {
@@ -295,7 +292,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const lengthMeters = section.summary?.length || 0;
                 const durationSeconds = section.summary?.duration || 0;
 
-                // --- 1. RIESGO DE ALTURA (Día 16) ---
+                // --- 1. RIESGO PROGRESIVO DE ALTURA (Día 18) ---
                 let segmentHeightLimit = 5.0; 
                 if (section.notices && section.notices.some(n => n.title.includes('height'))) {
                     segmentHeightLimit = truckHeight + 0.10; 
@@ -303,30 +300,41 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const heightMargin = segmentHeightLimit - truckHeight;
                 let heightRiskScore = 0;
 
-                if (heightMargin > 0.50) heightRiskScore = 0;
-                else if (heightMargin >= 0.20) heightRiskScore = 30;
-                else if (heightMargin >= 0.05) heightRiskScore = 70;
-                else heightRiskScore = 100;
+                const SAFE_HEIGHT_MARGIN = 0.50;
+                const CRITICAL_HEIGHT_MARGIN = 0.05;
 
-                // --- 2. RIESGO DE PESO (Día 17) ---
-                // Simulamos el límite de peso del tramo o puente (ej: 44 toneladas)
+                if (heightMargin >= SAFE_HEIGHT_MARGIN) {
+                    heightRiskScore = 0;
+                } else if (heightMargin <= CRITICAL_HEIGHT_MARGIN) {
+                    heightRiskScore = 100;
+                } else {
+                    // Interpolación lineal: (Seguro - Actual) / (Seguro - Crítico) * 100
+                    heightRiskScore = Math.round(((SAFE_HEIGHT_MARGIN - heightMargin) / (SAFE_HEIGHT_MARGIN - CRITICAL_HEIGHT_MARGIN)) * 100);
+                }
+
+                // --- 2. RIESGO PROGRESIVO DE PESO (Día 18) ---
                 let segmentWeightLimit = 44.0;
                 if (section.notices && section.notices.some(n => n.title.includes('weight'))) {
-                    segmentWeightLimit = truckWeight + 0.5; // Ajuste forzado si hay aviso
+                    segmentWeightLimit = truckWeight + 0.5;
                 }
                 const weightMargin = segmentWeightLimit - truckWeight;
                 let weightRiskScore = 0;
 
-                if (weightMargin > 5.0) weightRiskScore = 0;         // Verde: Seguro (> 5t de colchón)
-                else if (weightMargin >= 2.0) weightRiskScore = 30;  // Amarillo: Precaución (Entre 2 y 5t)
-                else if (weightMargin >= 0.5) weightRiskScore = 70;  // Naranja: Crítico (Entre 0.5 y 2t)
-                else weightRiskScore = 100;                          // Rojo: Hundimiento / Bloqueo (< 0.5t)
+                const SAFE_WEIGHT_MARGIN = 5.0;
+                const CRITICAL_WEIGHT_MARGIN = 0.5;
+
+                if (weightMargin >= SAFE_WEIGHT_MARGIN) {
+                    weightRiskScore = 0;
+                } else if (weightMargin <= CRITICAL_WEIGHT_MARGIN) {
+                    weightRiskScore = 100;
+                } else {
+                    // Interpolación lineal: (Seguro - Actual) / (Seguro - Crítico) * 100
+                    weightRiskScore = Math.round(((SAFE_WEIGHT_MARGIN - weightMargin) / (SAFE_WEIGHT_MARGIN - CRITICAL_WEIGHT_MARGIN)) * 100);
+                }
 
                 // --- 3. VEREDICTO FINAL (Principio de Máximo Peligro) ---
-                // Nos quedamos con la puntuación de riesgo más alta entre el peso y la altura
                 const physicalRiskScore = Math.max(heightRiskScore, weightRiskScore);
 
-                // Inserción en la bóveda con el margen de peso añadido
                 const segmentQuery = `
                     INSERT INTO route_segments (
                         response_id, segment_index, start_coords, end_coords, 
@@ -344,7 +352,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                     durationSeconds, 
                     heightMargin, 
                     physicalRiskScore,
-                    weightMargin // ¡La nueva columna del Día 17!
+                    weightMargin
                 ]);
                 segmentosGuardados++;
             }
@@ -352,7 +360,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         
         res.json({
             success: true,
-            message: 'Ruta calculada con Motor de Riesgo Físico Completo (Altura + Peso).',
+            message: 'Ruta calculada con Penalización Progresiva de Riesgo Físico (Día 18).',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             applied_physics: {
@@ -378,5 +386,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Riesgo Físico Completo (Día 17) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Riesgo Progresivo Activo (Día 18) en puerto ${port}`);
 });
