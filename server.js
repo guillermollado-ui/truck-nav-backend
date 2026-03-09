@@ -149,7 +149,7 @@ const validateVehicleByCountry = async (req, res, next) => {
 };
 
 // ==========================================
-// DÍA 12: MANEJO ROBUSTO Y REINTENTOS EXPONENCIALES PARA HERE API
+// DÍA 12 Y 16: MANEJO ROBUSTO Y REINTENTOS EXPONENCIALES PARA HERE API
 // ==========================================
 /**
  * Llama a la API de HERE con reintentos exponenciales en caso de fallos de red o errores 5xx.
@@ -161,8 +161,8 @@ const fetchRouteFromHEREWithRetry = async (origin, destination, vehicleHeight = 
         throw new Error('HERE_API_KEY no configurada en el servidor.');
     }
 
-    // Actualizado: Incluimos la altura en la petición a HERE para que el proveedor ya filtre
-    const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary,notices&truck[height]=${vehicleHeight}&apikey=${apiKey}`;
+    // CORREGIDO: Sintaxis exacta para HERE v8 -> vehicle[height] en lugar de truck[height]
+    const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary&vehicle[height]=${vehicleHeight}&apikey=${apiKey}`;
 
     try {
         const response = await axios.get(url);
@@ -302,10 +302,8 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
                 // --- DÍA 16: LÓGICA DE CÁLCULO DE MARGEN DE ALTURA ---
                 // Simulamos la obtención del límite del segmento desde los metadatos de HERE o por defecto
-                // En una implementación real, extraeríamos el 'maxHeight' de las restricciones del tramo
                 let segmentHeightLimit = 5.0; // Valor base por defecto (5 metros)
                 
-                // Si HERE detecta una restricción en los 'notices', ajustamos el límite para el cálculo
                 if (section.notices && section.notices.some(n => n.title.includes('height'))) {
                     segmentHeightLimit = truckHeight + 0.10; // Caso crítico detectado por el proveedor
                 }
