@@ -251,7 +251,7 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
 });
 
 // ==========================================
-// DÍA 16, 17, 18 Y 19: RIESGO PROGRESIVO Y UNIFICACIÓN EN TOTAL_SEGMENT_SCORE
+// DÍA 16 - 20: RIESGO PROGRESIVO Y PONDERACIÓN FINAL DE LA RUTA
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const { origin, destination, height_m, weight_t } = req.body;
@@ -274,9 +274,13 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
-        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando riesgos y unificando en total_segment_score (Día 19)...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando riesgos ponderados por distancia (Día 20)...`);
         let segmentosGuardados = 0;
         
+        // DÍA 20: Variables para acumular la ponderación
+        let totalRiskWeighted = 0;
+        let totalRouteLength = 0;
+
         if (routeData.routes && routeData.routes.length > 0) {
             const sections = routeData.routes[0].sections;
             
@@ -330,12 +334,13 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                     weightRiskScore = Math.round(((SAFE_WEIGHT_MARGIN - weightMargin) / (SAFE_WEIGHT_MARGIN - CRITICAL_WEIGHT_MARGIN)) * 100);
                 }
 
-                // --- 3. VEREDICTO FÍSICO (Principio de Máximo Peligro) ---
+                // --- 3. VEREDICTO FÍSICO Y SCORE DE SEGMENTO ---
                 const physicalRiskScore = Math.max(heightRiskScore, weightRiskScore);
-
-                // --- 4. SCORE TOTAL DEL SEGMENTO (Día 19) ---
-                // Aquí se unifica todo el peligro. En futuras etapas sumaremos penalizaciones contextuales.
                 const totalSegmentScore = physicalRiskScore;
+
+                // --- 4. DÍA 20: ACUMULACIÓN PARA LA PONDERACIÓN ---
+                totalRouteLength += lengthMeters;
+                totalRiskWeighted += (totalSegmentScore * lengthMeters);
 
                 const segmentQuery = `
                     INSERT INTO route_segments (
@@ -355,17 +360,28 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                     heightMargin, 
                     physicalRiskScore,
                     weightMargin,
-                    totalSegmentScore // ¡La caja unificadora del Día 19 en acción!
+                    totalSegmentScore
                 ]);
                 segmentosGuardados++;
             }
         }
+
+        // --- DÍA 20: CÁLCULO FINAL DE LA RUTA Y ACTUALIZACIÓN EN BÓVEDA ---
+        const finalRouteRisk = totalRouteLength > 0 ? Math.round(totalRiskWeighted / totalRouteLength) : 0;
+
+        const updateRouteQuery = `
+            UPDATE provider_responses
+            SET total_route_risk = $1
+            WHERE id = $2
+        `;
+        await pool.query(updateRouteQuery, [finalRouteRisk, savedId]);
         
         res.json({
             success: true,
-            message: 'Ruta calculada y puntaje total unificado en el segmento (Día 19).',
+            message: 'Ruta calculada y riesgo total ponderado guardado con éxito (Día 20).',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
+            final_route_risk: finalRouteRisk,
             applied_physics: {
                 height_m: truckHeight,
                 weight_t: truckWeight
@@ -389,5 +405,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Riesgo Unificado Activo (Día 19) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Riesgo Ponderado Final (Día 20) en puerto ${port}`);
 });
