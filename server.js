@@ -277,16 +277,61 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
 });
 
 // ==========================================
+// DÍA 25: LECTURA MAESTRA DE LA MATRIZ DE RIESGOS (ENDPOINT PARA LA APP MÓVIL)
+// ==========================================
+app.get('/api/route/:id', authenticateJWT, async (req, res, next) => {
+    const routeId = req.params.id;
+
+    try {
+        console.log(`[INFO] [TxID: ${req.correlationId}] App solicitando desglose maestro de la ruta ID: ${routeId}`);
+
+        // 1. Buscamos el resumen general de la ruta en la bóveda
+        const routeResult = await pool.query(
+            'SELECT id, origin_coords, destination_coords, total_route_risk, created_at FROM provider_responses WHERE id = $1',
+            [routeId]
+        );
+
+        if (routeResult.rowCount === 0) {
+            return res.status(404).json({ success: false, error: 'Ruta no encontrada en la bóveda.' });
+        }
+
+        const routeSummary = routeResult.rows[0];
+
+        // 2. Extraemos todos los segmentos con sus múltiples capas de riesgo
+        const segmentsResult = await pool.query(
+            'SELECT * FROM route_segments WHERE response_id = $1 ORDER BY segment_index ASC',
+            [routeId]
+        );
+
+        // 3. Empaquetamos todo de forma limpia para que la App Móvil lo procese al instante
+        res.json({
+            success: true,
+            route: {
+                id: routeSummary.id,
+                origin: routeSummary.origin_coords,
+                destination: routeSummary.destination_coords,
+                total_risk: routeSummary.total_route_risk,
+                created_at: routeSummary.created_at
+            },
+            total_segments: segmentsResult.rowCount,
+            segments: segmentsResult.rows
+        });
+
+    } catch (error) {
+        error.statusCode = 500;
+        next(error);
+    }
+});
+
+// ==========================================
 // DÍA 16 - 24: RIESGOS FÍSICOS, AMBIENTALES Y RESTRICCIONES HORARIAS
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
-    // DÍA 24: Añadimos la lectura de la hora de salida (departure_time)
     const { origin, destination, height_m, weight_t, euro_standard, country_code, departure_time } = req.body;
     const truckHeight = height_m || 4.0; 
     const truckWeight = weight_t || 40.0; 
     const truckEuro = euro_standard || 6; 
     const targetCountry = country_code || 'DEU'; 
-    // Si no manda hora, asumimos el momento exacto en que lanza la petición
     const startTime = departure_time ? new Date(departure_time) : new Date();
 
     if (!origin || !destination) {
@@ -294,7 +339,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
     }
 
     try {
-        console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta con reloj activo. Salida: ${startTime.toISOString()}`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta con matriz 3D. Salida: ${startTime.toISOString()}`);
         const routeData = await fetchRouteFromHEREWithRetry(origin, destination);
         
         const insertQuery = `
@@ -319,9 +364,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         let totalRouteLength = 0;
         let routeTouchesUrban = false; 
         let environmentalAlert = false;
-        let timeAlert = false; // Nueva bandera del Día 24
+        let timeAlert = false; 
         
-        let accumulatedDurationSeconds = 0; // El cronómetro interno del viaje
+        let accumulatedDurationSeconds = 0; 
 
         if (routeData.routes && routeData.routes.length > 0) {
             const sections = routeData.routes[0].sections;
@@ -338,7 +383,6 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const lengthMeters = section.summary?.length || 0;
                 const durationSeconds = section.summary?.duration || 0;
 
-                // Sumamos el tiempo de viaje hasta llegar a este tramo
                 accumulatedDurationSeconds += durationSeconds;
                 const segmentTime = new Date(startTime.getTime() + (accumulatedDurationSeconds * 1000));
                 const segmentHour = segmentTime.getHours();
@@ -383,14 +427,12 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
                 // --- 4. RESTRICCIONES HORARIAS (DÍA 24) ---
                 let timeRestrictionRiskScore = 0;
-                // Simulamos la restricción: Prohibido camiones en zona urbana densa de 22:00 a 06:00
                 if (isUrbanDense && (segmentHour >= 22 || segmentHour < 6)) {
                     timeRestrictionRiskScore = 100;
                     timeAlert = true;
                 }
 
                 // --- 5. VEREDICTO FINAL: PRINCIPIO DE MÁXIMO PELIGRO ---
-                // Ahora enfrentamos al camión contra los 4 jinetes: altura, peso, contaminación y reloj
                 const physicalRiskScore = Math.max(heightRiskScore, weightRiskScore);
                 const contextualRiskScore = Math.max(environmentalRiskScore, timeRestrictionRiskScore);
                 const totalSegmentScore = Math.max(physicalRiskScore, contextualRiskScore);
@@ -421,7 +463,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                     totalSegmentScore,
                     isUrbanDense,
                     environmentalRiskScore,
-                    timeRestrictionRiskScore // El guardián del tiempo del Día 24
+                    timeRestrictionRiskScore 
                 ]);
                 segmentosGuardados++;
             }
@@ -438,14 +480,14 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         
         res.json({
             success: true,
-            message: 'Ruta calculada con análisis total de la matriz de riesgos (Día 24).',
+            message: 'Ruta calculada con análisis total de la matriz de riesgos.',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             final_route_risk: finalRouteRisk,
             alerts: {
                 urban_zone: routeTouchesUrban,
                 environmental_multa: environmentalAlert,
-                time_restriction: timeAlert // Aviso de horario para la app
+                time_restriction: timeAlert 
             },
             applied_context: {
                 euro_standard: truckEuro,
@@ -470,5 +512,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Reloj Biológico Activo (Día 24) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Matriz de Riesgos (Día 25) en puerto ${port}`);
 });
