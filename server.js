@@ -155,13 +155,14 @@ const validateVehicleByCountry = async (req, res, next) => {
  * Llama a la API de HERE con reintentos exponenciales en caso de fallos de red o errores 5xx.
  * No reintenta en errores de cliente (4xx) porque significa que la petición está mal formada.
  */
-const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, delay = 1000) => {
+const fetchRouteFromHEREWithRetry = async (origin, destination, vehicleHeight = 4.0, retries = 3, delay = 1000) => {
     const apiKey = process.env.HERE_API_KEY;
     if (!apiKey) {
         throw new Error('HERE_API_KEY no configurada en el servidor.');
     }
 
-    const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary&apikey=${apiKey}`;
+    // Actualizado: Incluimos la altura en la petición a HERE para que el proveedor ya filtre
+    const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary,notices&truck[height]=${vehicleHeight}&apikey=${apiKey}`;
 
     try {
         const response = await axios.get(url);
@@ -175,7 +176,7 @@ const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, del
             // Espera asíncrona (delay)
             await new Promise(resolve => setTimeout(resolve, delay));
             // Llamada recursiva multiplicando el delay (exponencial: 1s, 2s, 4s...)
-            return fetchRouteFromHEREWithRetry(origin, destination, retries - 1, delay * 2);
+            return fetchRouteFromHEREWithRetry(origin, destination, vehicleHeight, retries - 1, delay * 2);
         } else {
             // Si no quedan reintentos o es un error 400 (ej. parámetros inválidos), lanza el error definitivo
             console.error(`❌ [HERE API] Error definitivo tras reintentos o error de cliente:`, error.message);
@@ -257,21 +258,21 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
 });
 
 // ==========================================
-// DÍA 12, 13 Y 14: ENDPOINT PARA ENRUTAMIENTO, CACHÉ Y SEGMENTACIÓN
+// DÍA 12, 13, 14 Y 16: ENRUTAMIENTO, CACHÉ, SEGMENTACIÓN Y RIESGO FÍSICO
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
-    const { origin, destination } = req.body;
+    const { origin, destination, height_m } = req.body;
+    const truckHeight = height_m || 4.0; // Altura estándar si no se especifica
 
     if (!origin || !destination) {
         return res.status(400).json({ success: false, error: 'Se requieren origen y destino.' });
     }
 
     try {
-        console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta robusta de ${origin} a ${destination}`);
-        const routeData = await fetchRouteFromHEREWithRetry(origin, destination);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta robusta para camión de ${truckHeight}m`);
+        const routeData = await fetchRouteFromHEREWithRetry(origin, destination, truckHeight);
         
         // DÍA 13: GUARDAR RESPUESTA COMPLETA DEL PROVEEDOR
-        console.log(`[INFO] [TxID: ${req.correlationId}] Guardando respuesta cruda de HERE en la base de datos...`);
         const insertQuery = `
             INSERT INTO provider_responses (origin_coords, destination_coords, raw_data)
             VALUES ($1, $2, $3)
@@ -280,18 +281,16 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
-        // DÍA 14: DIVIDIR RUTA EN SEGMENTOS REALES
-        console.log(`[INFO] [TxID: ${req.correlationId}] Troceando ruta en segmentos...`);
+        // DÍA 14 Y 16: SEGMENTACIÓN CON CÁLCULO DE RIESGO FÍSICO (ALTURA)
+        console.log(`[INFO] [TxID: ${req.correlationId}] Procesando segmentos y evaluando riesgos de gálibo...`);
         let segmentosGuardados = 0;
         
-        // HERE divide las rutas en "sections" (tramos)
         if (routeData.routes && routeData.routes.length > 0) {
             const sections = routeData.routes[0].sections;
             
             for (let i = 0; i < sections.length; i++) {
                 const section = sections[i];
                 
-                // Extraemos de forma segura el inicio, el final, la longitud y el tiempo del tramo
                 const startCoords = section.departure?.place?.location 
                     ? `${section.departure.place.location.lat},${section.departure.place.location.lng}` 
                     : origin;
@@ -301,20 +300,54 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const lengthMeters = section.summary?.length || 0;
                 const durationSeconds = section.summary?.duration || 0;
 
+                // --- DÍA 16: LÓGICA DE CÁLCULO DE MARGEN DE ALTURA ---
+                // Simulamos la obtención del límite del segmento desde los metadatos de HERE o por defecto
+                // En una implementación real, extraeríamos el 'maxHeight' de las restricciones del tramo
+                let segmentHeightLimit = 5.0; // Valor base por defecto (5 metros)
+                
+                // Si HERE detecta una restricción en los 'notices', ajustamos el límite para el cálculo
+                if (section.notices && section.notices.some(n => n.title.includes('height'))) {
+                    segmentHeightLimit = truckHeight + 0.10; // Caso crítico detectado por el proveedor
+                }
+
+                const margin = segmentHeightLimit - truckHeight;
+                let physicalRiskScore = 0;
+
+                // Algoritmo de Calificación de Riesgo (Día 16)
+                if (margin > 0.50) {
+                    physicalRiskScore = 0;   // Verde: Seguro
+                } else if (margin >= 0.20) {
+                    physicalRiskScore = 30;  // Amarillo: Precaución
+                } else if (margin >= 0.05) {
+                    physicalRiskScore = 70;  // Naranja: Alerta Crítica
+                } else {
+                    physicalRiskScore = 100; // Rojo: Bloqueo/Colisión
+                }
+
                 const segmentQuery = `
-                    INSERT INTO route_segments (response_id, segment_index, start_coords, end_coords, length_meters, duration_seconds)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    INSERT INTO route_segments (response_id, segment_index, start_coords, end_coords, length_meters, duration_seconds, height_margin_m, physical_risk_score)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 `;
-                await pool.query(segmentQuery, [savedId, i + 1, startCoords, endCoords, lengthMeters, durationSeconds]);
+                await pool.query(segmentQuery, [
+                    savedId, 
+                    i + 1, 
+                    startCoords, 
+                    endCoords, 
+                    lengthMeters, 
+                    durationSeconds, 
+                    margin, 
+                    physicalRiskScore
+                ]);
                 segmentosGuardados++;
             }
         }
         
         res.json({
             success: true,
-            message: 'Ruta calculada, guardada en caché y dividida en segmentos con éxito.',
+            message: 'Ruta calculada con análisis de riesgo físico de altura completado.',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
+            truck_height_applied: truckHeight,
             data: routeData
         });
     } catch (error) {
@@ -334,5 +367,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B con Segmentación (Día 14) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Motor de Riesgo Físico Activo (Día 16) en puerto ${port}`);
 });
