@@ -277,19 +277,22 @@ app.post('/api/vehicles', authenticateJWT, validateVehicleByCountry, async (req,
 });
 
 // ==========================================
-// DÍA 16 - 22: RIESGO PROGRESIVO, PONDERACIÓN FINAL Y DETECCIÓN URBANA
+// DÍA 16 - 23: RIESGO PROGRESIVO, DETECCIÓN URBANA Y MULTAS ZBE
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
-    const { origin, destination, height_m, weight_t } = req.body;
+    // DÍA 23: Extraemos el estándar Euro del motor y el país para la ZBE
+    const { origin, destination, height_m, weight_t, euro_standard, country_code } = req.body;
     const truckHeight = height_m || 4.0; 
     const truckWeight = weight_t || 40.0; 
+    const truckEuro = euro_standard || 6; // Por defecto asumimos el motor más limpio (Euro 6)
+    const targetCountry = country_code || 'DEU'; // Para nuestra prueba en Berlín, asumimos DEU
 
     if (!origin || !destination) {
         return res.status(400).json({ success: false, error: 'Se requieren origen y destino.' });
     }
 
     try {
-        console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta para camión (H: ${truckHeight}m, W: ${truckWeight}t)`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta para camión (H: ${truckHeight}m, W: ${truckWeight}t, Euro: ${truckEuro})`);
         const routeData = await fetchRouteFromHEREWithRetry(origin, destination);
         
         const insertQuery = `
@@ -300,15 +303,23 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
-        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando riesgos físicos y densidad urbana (Día 22)...`);
-        let segmentosGuardados = 0;
+        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando Zonas Ambientales (Día 23)...`);
         
-        // DÍA 20: Variables para acumular la ponderación
+        // --- DÍA 23: PRECARGA DE LEYES AMBIENTALES ---
+        // Consultamos qué pide la ZBE más estricta de este país
+        const zoneResult = await pool.query('SELECT * FROM environmental_zones WHERE country_code = $1', [targetCountry]);
+        const activeZones = zoneResult.rows;
+        let requiredEuro = 0;
+        if (activeZones.length > 0) {
+            // Buscamos la exigencia más alta para protegernos en el peor escenario
+            requiredEuro = Math.max(...activeZones.map(z => z.min_euro_standard));
+        }
+
+        let segmentosGuardados = 0;
         let totalRiskWeighted = 0;
         let totalRouteLength = 0;
-
-        // Bandera para saber si toda la ruta tocó alguna zona densa
         let routeTouchesUrban = false; 
+        let environmentalAlert = false;
 
         if (routeData.routes && routeData.routes.length > 0) {
             const sections = routeData.routes[0].sections;
@@ -325,10 +336,8 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const lengthMeters = section.summary?.length || 0;
                 const durationSeconds = section.summary?.duration || 0;
 
-                // --- DÍA 22: RADAR DE ZONA URBANA DENSA ---
-                // Calculamos la velocidad media en metros por segundo
+                // --- RADAR DE ZONA URBANA DENSA (Día 22) ---
                 const speedMps = durationSeconds > 0 ? (lengthMeters / durationSeconds) : 0;
-                // Si la velocidad es menor a 13.88 m/s (50 km/h) y se mueve, asumimos tráfico denso/urbano
                 const isUrbanDense = (speedMps > 0 && speedMps < 13.88);
                 if (isUrbanDense) routeTouchesUrban = true;
 
@@ -339,17 +348,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 }
                 const heightMargin = segmentHeightLimit - truckHeight;
                 let heightRiskScore = 0;
-
-                const SAFE_HEIGHT_MARGIN = 0.50;
-                const CRITICAL_HEIGHT_MARGIN = 0.05;
-
-                if (heightMargin >= SAFE_HEIGHT_MARGIN) {
-                    heightRiskScore = 0;
-                } else if (heightMargin <= CRITICAL_HEIGHT_MARGIN) {
-                    heightRiskScore = 100;
-                } else {
-                    heightRiskScore = Math.round(((SAFE_HEIGHT_MARGIN - heightMargin) / (SAFE_HEIGHT_MARGIN - CRITICAL_HEIGHT_MARGIN)) * 100);
-                }
+                if (heightMargin >= 0.50) heightRiskScore = 0;
+                else if (heightMargin <= 0.05) heightRiskScore = 100;
+                else heightRiskScore = Math.round(((0.50 - heightMargin) / (0.50 - 0.05)) * 100);
 
                 // --- 2. RIESGO PROGRESIVO DE PESO ---
                 let segmentWeightLimit = 44.0;
@@ -358,35 +359,42 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 }
                 const weightMargin = segmentWeightLimit - truckWeight;
                 let weightRiskScore = 0;
+                if (weightMargin >= 5.0) weightRiskScore = 0;
+                else if (weightMargin <= 0.5) weightRiskScore = 100;
+                else weightRiskScore = Math.round(((5.0 - weightMargin) / (5.0 - 0.5)) * 100);
 
-                const SAFE_WEIGHT_MARGIN = 5.0;
-                const CRITICAL_WEIGHT_MARGIN = 0.5;
-
-                if (weightMargin >= SAFE_WEIGHT_MARGIN) {
-                    weightRiskScore = 0;
-                } else if (weightMargin <= CRITICAL_WEIGHT_MARGIN) {
-                    weightRiskScore = 100;
-                } else {
-                    weightRiskScore = Math.round(((SAFE_WEIGHT_MARGIN - weightMargin) / (SAFE_WEIGHT_MARGIN - CRITICAL_WEIGHT_MARGIN)) * 100);
+                // --- 3. RIESGO AMBIENTAL Y MULTAS ZBE (DÍA 23) ---
+                let environmentalRiskScore = 0;
+                // Si estamos en la ciudad y hay una ley ambiental activa...
+                if (isUrbanDense && requiredEuro > 0) {
+                    if (truckEuro < requiredEuro) {
+                        environmentalRiskScore = 100; // ¡Multa segura! El motor es demasiado viejo
+                        environmentalAlert = true;
+                    } else if (truckEuro === requiredEuro) {
+                        environmentalRiskScore = 30;  // Pasa por los pelos
+                    } else {
+                        environmentalRiskScore = 0;   // Motor limpio y seguro
+                    }
                 }
 
-                // --- 3. VEREDICTO FÍSICO Y SCORE DE SEGMENTO ---
+                // --- 4. VEREDICTO FINAL: PRINCIPIO DE MÁXIMO PELIGRO ---
                 const physicalRiskScore = Math.max(heightRiskScore, weightRiskScore);
-                const totalSegmentScore = physicalRiskScore;
+                // El score total ahora tiene en cuenta tanto que no choques como que no te multen
+                const totalSegmentScore = Math.max(physicalRiskScore, environmentalRiskScore);
 
-                // --- 4. ACUMULACIÓN PARA LA PONDERACIÓN ---
+                // --- 5. ACUMULACIÓN PARA LA PONDERACIÓN ---
                 totalRouteLength += lengthMeters;
                 totalRiskWeighted += (totalSegmentScore * lengthMeters);
 
-                // Insertamos el segmento con el nuevo interruptor (is_urban_dense)
+                // Insertamos en la Bóveda con la nueva columna ambiental
                 const segmentQuery = `
                     INSERT INTO route_segments (
                         response_id, segment_index, start_coords, end_coords, 
                         length_meters, duration_seconds, height_margin_m, 
                         physical_risk_score, weight_margin_t, total_segment_score,
-                        is_urban_dense
+                        is_urban_dense, environmental_risk_score
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 `;
                 await pool.query(segmentQuery, [
                     savedId, 
@@ -399,7 +407,8 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                     physicalRiskScore,
                     weightMargin,
                     totalSegmentScore,
-                    isUrbanDense // ¡La detección del Día 22 en acción!
+                    isUrbanDense,
+                    environmentalRiskScore // El dato fresco del Día 23
                 ]);
                 segmentosGuardados++;
             }
@@ -417,11 +426,16 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         
         res.json({
             success: true,
-            message: 'Ruta calculada con detección urbana (Día 22).',
+            message: 'Ruta calculada con análisis físico y ambiental (ZBE) completado (Día 23).',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             final_route_risk: finalRouteRisk,
             urban_zone_detected: routeTouchesUrban,
+            environmental_alert: environmentalAlert,
+            applied_context: {
+                euro_standard: truckEuro,
+                required_euro: requiredEuro
+            },
             data: routeData
         });
     } catch (error) {
@@ -441,5 +455,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Radar Urbano Activo (Día 22) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Riesgo Ambiental Activo (Día 23) en puerto ${port}`);
 });
