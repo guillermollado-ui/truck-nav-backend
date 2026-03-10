@@ -26,6 +26,17 @@ if (!API_KEY) {
 }
 
 // ==========================================
+// HERRAMIENTA CRIPTOGRÁFICA: JSON DETERMINISTA
+// ==========================================
+const sortJSON = (obj) => {
+    if (!obj || typeof obj !== 'object') return JSON.stringify(obj);
+    const sortedKeys = Object.keys(obj).sort();
+    const sortedObj = {};
+    sortedKeys.forEach(key => sortedObj[key] = obj[key]);
+    return JSON.stringify(sortedObj);
+};
+
+// ==========================================
 // CONFIGURACIÓN DE PROXY (Solución Render)
 // ==========================================
 app.set('trust proxy', 1);
@@ -399,19 +410,19 @@ app.get('/api/legal/verify/:response_id', authenticateJWT, async (req, res, next
 
         const auditData = auditResult.rows[0];
 
-        // 1. Reconstruimos los JSON idénticos a como se guardaron
-        const strAlerts = JSON.stringify(auditData.alerts_triggered);
-        const strContext = JSON.stringify(auditData.applied_context);
-        const strVehicle = JSON.stringify(auditData.vehicle_snapshot);
-        const strRules = JSON.stringify(auditData.rules_snapshot);
+        // 1. Usamos el JSON determinista para asegurar que las letras están en el mismo orden que cuando se firmó
+        const strAlerts = sortJSON(auditData.alerts_triggered);
+        const strContext = sortJSON(auditData.applied_context);
+        const strVehicle = sortJSON(auditData.vehicle_snapshot);
+        const strRules = sortJSON(auditData.rules_snapshot);
 
-        // 2. Reconstruimos la cadena de texto exacta para la firma
+        // 2. Reconstruimos la cadena de texto
         const payloadToHash = `${auditData.response_id}_${auditData.origin_coords}_${auditData.destination_coords}_${auditData.final_risk_score}_${strAlerts}_${strContext}_${strVehicle}_${strRules}`;
         
-        // 3. Volvemos a pasar el contenido por la batidora SHA-256
+        // 3. Volvemos a batir la firma
         const currentHash = crypto.createHash('sha256').update(payloadToHash).digest('hex');
 
-        // 4. El momento de la verdad: ¿Coincide la firma actual con el candado que guardamos el Día 28?
+        // 4. ¿Coincide?
         const isIntact = currentHash === auditData.decision_hash;
 
         res.json({
@@ -626,12 +637,13 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             night_restriction_end_hour: 6
         };
         
-        const strAlerts = JSON.stringify(alertsObj);
-        const strContext = JSON.stringify(contextObj);
-        const strVehicle = JSON.stringify(vehicleSnapshotObj);
-        const strRules = JSON.stringify(rulesSnapshotObj);
+        // Usamos el JSON determinista ANTES de firmar para que nunca falle la auditoría
+        const strAlerts = sortJSON(alertsObj);
+        const strContext = sortJSON(contextObj);
+        const strVehicle = sortJSON(vehicleSnapshotObj);
+        const strRules = sortJSON(rulesSnapshotObj);
 
-        // DÍA 28: El Motor Criptográfico. Si algo cambia, el hash se rompe.
+        // DÍA 28: El Motor Criptográfico.
         const payloadToHash = `${savedId}_${origin}_${destination}_${finalRouteRisk}_${strAlerts}_${strContext}_${strVehicle}_${strRules}`;
         const decisionHash = crypto.createHash('sha256').update(payloadToHash).digest('hex');
         
@@ -643,6 +655,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `;
         
+        // Guardamos los strings ya ordenados en la base de datos
         await pool.query(logQuery, [
             savedId,
             origin,
@@ -688,5 +701,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Caja Negra 100% Auditada (Día 30) activa en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Caja Negra 100% Auditada y Determinista (Día 30) activa en puerto ${port}`);
 });
