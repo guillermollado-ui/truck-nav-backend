@@ -336,7 +336,7 @@ app.get('/api/route/:id', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 16 - 26: RIESGOS FÍSICOS Y CAJA NEGRA LEGAL
+// DÍA 16 - 27: RIESGOS FÍSICOS Y CAJA NEGRA LEGAL (CON SNAPSHOTS)
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const { origin, destination, height_m, weight_t, euro_standard, country_code, departure_time } = req.body;
@@ -501,16 +501,10 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         await pool.query(updateRouteQuery, [finalRouteRisk, savedId]);
 
         // ==========================================
-        // DÍA 26: LA CAJA NEGRA LEGAL (NOTARIO DIGITAL)
+        // DÍA 26 y 27: LA CAJA NEGRA LEGAL (NOTARIO DIGITAL Y SNAPSHOTS)
         // ==========================================
-        console.log(`[INFO] [TxID: ${req.correlationId}] ⚖️ Sellando decisión en la Caja Negra Legal (Día 26)...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] 📸 Sellando decisión con Snapshots en la Caja Negra Legal (Día 27)...`);
         
-        const logQuery = `
-            INSERT INTO route_decision_logs (
-                response_id, origin_coords, destination_coords, 
-                final_risk_score, alerts_triggered, applied_context
-            ) VALUES ($1, $2, $3, $4, $5, $6)
-        `;
         const alertsObj = { 
             urban_zone: routeTouchesUrban, 
             environmental_multa: environmentalAlert, 
@@ -520,20 +514,47 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             euro_standard: truckEuro, 
             departure_time: startTime.toISOString() 
         };
+
+        // DÍA 27: Fotografía exacta del vehículo en este milisegundo
+        const vehicleSnapshotObj = {
+            height_m: truckHeight,
+            weight_t: truckWeight,
+            euro_standard: truckEuro
+        };
+
+        // DÍA 27: Fotografía exacta de las leyes aplicadas en este milisegundo
+        const rulesSnapshotObj = {
+            country_code: targetCountry,
+            required_euro_zone: requiredEuro,
+            height_safety_buffer_m: 0.5,
+            weight_safety_buffer_t: 5.0,
+            night_restriction_start_hour: 22,
+            night_restriction_end_hour: 6
+        };
+        
+        const logQuery = `
+            INSERT INTO route_decision_logs (
+                response_id, origin_coords, destination_coords, 
+                final_risk_score, alerts_triggered, applied_context,
+                vehicle_snapshot, rules_snapshot
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `;
         
         await pool.query(logQuery, [
             savedId,
             origin,
             destination,
             finalRouteRisk,
-            JSON.stringify(alertsObj), // <-- CORRECCIÓN: Evitamos el [object Object]
-            JSON.stringify(contextObj) // <-- CORRECCIÓN: Formato perfecto para JSONB
+            JSON.stringify(alertsObj),
+            JSON.stringify(contextObj),
+            JSON.stringify(vehicleSnapshotObj), // DÍA 27 INYECTADO
+            JSON.stringify(rulesSnapshotObj)    // DÍA 27 INYECTADO
         ]);
         // ==========================================
         
         res.json({
             success: true,
-            message: 'Ruta calculada y decisión sellada en la Caja Negra (Día 26).',
+            message: 'Ruta calculada y decisión sellada con Snapshots en la Caja Negra (Día 27).',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             final_route_risk: finalRouteRisk,
@@ -551,7 +572,6 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 app.use((err, req, res, next) => {
     const statusCode = err.statusCode || 500;
     
-    // AÑADIDO: Visión láser para la arquitecta si algo falla.
     console.error(`❌ [ERROR FATAL] TxID: ${req.correlationId || 'N/A'}`);
     console.error(err.stack);
     
@@ -563,5 +583,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Caja Negra Legal Activa (Día 26) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Caja Negra con Snapshots (Día 27) activa en puerto ${port}`);
 });
