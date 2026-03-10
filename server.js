@@ -4,7 +4,6 @@ const cors = require('cors');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
-// AÑADIDO: Axios para las peticiones a HERE
 const axios = require('axios'); 
 require('dotenv').config();
 
@@ -12,6 +11,19 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 const environment = process.env.NODE_ENV || 'development';
+
+// ==========================================
+// OPERACIÓN ESCUDO: FAIL-FAST VARIABLES DE ENTORNO
+// ==========================================
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    throw new Error("❌ FATAL: JWT_SECRET no definido en el entorno. Abortando arranque por seguridad.");
+}
+
+const API_KEY = process.env.API_KEY;
+if (!API_KEY) {
+    throw new Error("❌ FATAL: API_KEY no definido en el entorno. Abortando arranque por seguridad.");
+}
 
 // ==========================================
 // CONFIGURACIÓN DE PROXY (Solución Render)
@@ -47,14 +59,22 @@ app.use((req, res, next) => {
     next();
 });
 
-const poolConfig = { connectionString: process.env.DATABASE_URL };
+// ==========================================
+// OPERACIÓN ESCUDO: LIMITACIÓN DEL POOL DB
+// ==========================================
+const poolConfig = { 
+    connectionString: process.env.DATABASE_URL,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000
+};
 if (environment === 'production' || environment === 'staging') {
     poolConfig.ssl = { rejectUnauthorized: false };
 }
 const pool = new Pool(poolConfig);
 
 pool.connect()
-    .then(() => console.log('✅ [OK] Bóveda de datos conectada con éxito (PostgreSQL)'))
+    .then(() => console.log('✅ [OK] Bóveda de datos conectada con éxito (PostgreSQL) - Modo Optimizado'))
     .catch(err => console.error('❌ [FATAL] Error conectando a la base de datos', err.stack));
 
 app.get('/', (req, res) => {
@@ -67,11 +87,10 @@ app.get('/', (req, res) => {
 });
 
 // 3. LA TAQUILLA (Generación JWT)
-const JWT_SECRET = process.env.JWT_SECRET || 'tu_secreto_super_seguro_para_desarrollo_123';
-
 app.post('/api/auth/token', (req, res) => {
     const { api_key } = req.body;
-    if (api_key === (process.env.API_KEY || 'llave-maestra-trucknav-2026')) {
+    // OPERACIÓN ESCUDO: Validación estricta sin fallbacks
+    if (api_key === API_KEY) {
         const token = jwt.sign(
             { role: 'truck_client', access: 'fleet_data' },
             JWT_SECRET,
@@ -103,10 +122,9 @@ const authenticateJWT = (req, res, next) => {
 // ==========================================
 const validateVehicleByCountry = async (req, res, next) => {
     const { height_m, weight_t, country_code } = req.body;
-    const targetCountry = country_code || 'ESP'; // Por defecto España si no se envía
+    const targetCountry = country_code || 'ESP'; 
 
     try {
-        // Consultamos las reglas vigentes para ese país en la DB
         const ruleResult = await pool.query(
             'SELECT * FROM country_rules WHERE country_code = $1', 
             [targetCountry]
@@ -122,7 +140,6 @@ const validateVehicleByCountry = async (req, res, next) => {
         const rules = ruleResult.rows[0];
         const errors = [];
 
-        // Validación dinámica contra la base de datos
         if (height_m > rules.max_height_m) {
             errors.push(`Altura excede el límite de ${rules.country_name} (${rules.max_height_m}m)`);
         }
@@ -140,7 +157,6 @@ const validateVehicleByCountry = async (req, res, next) => {
             });
         }
 
-        // Guardamos las reglas en el objeto request por si las necesitamos después
         req.countryRules = rules;
         next();
     } catch (error) {
@@ -157,11 +173,11 @@ const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, del
         throw new Error('HERE_API_KEY no configurada en el servidor.');
     }
 
-    // URL ultra-estable de HERE (v8)
     const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary&apikey=${apiKey}`;
 
     try {
-        const response = await axios.get(url);
+        // OPERACIÓN ESCUDO: Timeout estricto de 5 segundos
+        const response = await axios.get(url, { timeout: 5000 });
         return response.data;
     } catch (error) {
         const isNetworkError = !error.response; 
@@ -285,7 +301,6 @@ app.get('/api/route/:id', authenticateJWT, async (req, res, next) => {
     try {
         console.log(`[INFO] [TxID: ${req.correlationId}] App solicitando desglose maestro de la ruta ID: ${routeId}`);
 
-        // 1. Buscamos el resumen general de la ruta en la bóveda
         const routeResult = await pool.query(
             'SELECT id, origin_coords, destination_coords, total_route_risk, created_at FROM provider_responses WHERE id = $1',
             [routeId]
@@ -297,13 +312,11 @@ app.get('/api/route/:id', authenticateJWT, async (req, res, next) => {
 
         const routeSummary = routeResult.rows[0];
 
-        // 2. Extraemos todos los segmentos con sus múltiples capas de riesgo
         const segmentsResult = await pool.query(
             'SELECT * FROM route_segments WHERE response_id = $1 ORDER BY segment_index ASC',
             [routeId]
         );
 
-        // 3. Empaquetamos todo de forma limpia para que la App Móvil lo procese al instante
         res.json({
             success: true,
             route: {
@@ -340,7 +353,29 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
     try {
         console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta con matriz 3D. Salida: ${startTime.toISOString()}`);
-        const routeData = await fetchRouteFromHEREWithRetry(origin, destination);
+        
+        // ==========================================
+        // OPERACIÓN ESCUDO: CACHÉ INTELIGENTE DE RUTAS
+        // ==========================================
+        const routeKey = crypto.createHash('sha256').update(`${origin}_${destination}_${truckHeight}_${truckWeight}_${truckEuro}`).digest('hex');
+        let routeData;
+        
+        const cacheResult = await pool.query('SELECT raw_response FROM route_cache WHERE route_key = $1', [routeKey]);
+        
+        if (cacheResult.rowCount > 0) {
+            console.log(`[INFO] [TxID: ${req.correlationId}] ⚡ Ruta recuperada de la caché (Costo HERE API evitado)`);
+            routeData = cacheResult.rows[0].raw_response;
+        } else {
+            console.log(`[INFO] [TxID: ${req.correlationId}] 📡 Consultando HERE API (Nueva ruta)...`);
+            routeData = await fetchRouteFromHEREWithRetry(origin, destination);
+            
+            // Guardamos en la bóveda de caché para el futuro de forma no bloqueante
+            await pool.query(
+                'INSERT INTO route_cache (route_key, raw_response) VALUES ($1, $2) ON CONFLICT (route_key) DO NOTHING', 
+                [routeKey, routeData]
+            );
+        }
+        // ==========================================
         
         const insertQuery = `
             INSERT INTO provider_responses (origin_coords, destination_coords, raw_data)
@@ -350,7 +385,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
-        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando Zonas Ambientales y Restricciones de Reloj (Día 24)...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando Zonas Ambientales y Restricciones de Reloj...`);
         
         const zoneResult = await pool.query('SELECT * FROM environmental_zones WHERE country_code = $1', [targetCountry]);
         const activeZones = zoneResult.rows;
@@ -512,5 +547,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Matriz de Riesgos (Día 25) en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Operación Escudo Activa en puerto ${port}`);
 });
