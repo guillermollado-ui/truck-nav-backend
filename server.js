@@ -336,7 +336,7 @@ app.get('/api/route/:id', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 16 - 27: RIESGOS FÍSICOS Y CAJA NEGRA LEGAL (CON SNAPSHOTS)
+// DÍA 16 - 28: RIESGOS FÍSICOS Y CAJA NEGRA CON HASH INMUTABLE
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const { origin, destination, height_m, weight_t, euro_standard, country_code, departure_time } = req.body;
@@ -501,9 +501,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         await pool.query(updateRouteQuery, [finalRouteRisk, savedId]);
 
         // ==========================================
-        // DÍA 26 y 27: LA CAJA NEGRA LEGAL (NOTARIO DIGITAL Y SNAPSHOTS)
+        // DÍA 26, 27 y 28: LA CAJA NEGRA LEGAL CON HASH INMUTABLE
         // ==========================================
-        console.log(`[INFO] [TxID: ${req.correlationId}] 📸 Sellando decisión con Snapshots en la Caja Negra Legal (Día 27)...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] 🔐 Generando Hash Criptográfico Inmutable (Día 28)...`);
         
         const alertsObj = { 
             urban_zone: routeTouchesUrban, 
@@ -515,14 +515,12 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             departure_time: startTime.toISOString() 
         };
 
-        // DÍA 27: Fotografía exacta del vehículo en este milisegundo
         const vehicleSnapshotObj = {
             height_m: truckHeight,
             weight_t: truckWeight,
             euro_standard: truckEuro
         };
 
-        // DÍA 27: Fotografía exacta de las leyes aplicadas en este milisegundo
         const rulesSnapshotObj = {
             country_code: targetCountry,
             required_euro_zone: requiredEuro,
@@ -532,12 +530,21 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             night_restriction_end_hour: 6
         };
         
+        const strAlerts = JSON.stringify(alertsObj);
+        const strContext = JSON.stringify(contextObj);
+        const strVehicle = JSON.stringify(vehicleSnapshotObj);
+        const strRules = JSON.stringify(rulesSnapshotObj);
+
+        // DÍA 28: El Motor Criptográfico. Si algo cambia, el hash se rompe.
+        const payloadToHash = `${savedId}_${origin}_${destination}_${finalRouteRisk}_${strAlerts}_${strContext}_${strVehicle}_${strRules}`;
+        const decisionHash = crypto.createHash('sha256').update(payloadToHash).digest('hex');
+        
         const logQuery = `
             INSERT INTO route_decision_logs (
                 response_id, origin_coords, destination_coords, 
                 final_risk_score, alerts_triggered, applied_context,
-                vehicle_snapshot, rules_snapshot
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                vehicle_snapshot, rules_snapshot, decision_hash
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `;
         
         await pool.query(logQuery, [
@@ -545,21 +552,23 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             origin,
             destination,
             finalRouteRisk,
-            JSON.stringify(alertsObj),
-            JSON.stringify(contextObj),
-            JSON.stringify(vehicleSnapshotObj), // DÍA 27 INYECTADO
-            JSON.stringify(rulesSnapshotObj)    // DÍA 27 INYECTADO
+            strAlerts,
+            strContext,
+            strVehicle,
+            strRules,
+            decisionHash // <-- DÍA 28 INYECTADO
         ]);
         // ==========================================
         
         res.json({
             success: true,
-            message: 'Ruta calculada y decisión sellada con Snapshots en la Caja Negra (Día 27).',
+            message: 'Ruta calculada y sellada criptográficamente (Día 28).',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             final_route_risk: finalRouteRisk,
             alerts: alertsObj,
             applied_context: contextObj,
+            hash: decisionHash, // Se lo devolvemos a la App como acuse de recibo
             data: routeData
         });
     } catch (error) {
@@ -583,5 +592,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Caja Negra con Snapshots (Día 27) activa en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Caja Negra con Hash Criptográfico (Día 28) activa en puerto ${port}`);
 });
