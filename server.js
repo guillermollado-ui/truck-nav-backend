@@ -336,6 +336,50 @@ app.get('/api/route/:id', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
+// DÍA 29: MÁQUINA DEL TIEMPO LEGAL (AUDITORÍA HISTÓRICA)
+// ==========================================
+app.get('/api/legal/audit/:response_id', authenticateJWT, async (req, res, next) => {
+    const responseId = req.params.response_id;
+
+    try {
+        console.log(`[INFO] [TxID: ${req.correlationId}] 🔍 Solicitando auditoría legal para la ruta ID: ${responseId}`);
+
+        const auditResult = await pool.query(
+            'SELECT * FROM route_decision_logs WHERE response_id = $1',
+            [responseId]
+        );
+
+        if (auditResult.rowCount === 0) {
+            return res.status(404).json({ success: false, error: 'Registro de auditoría no encontrado en la Caja Negra.' });
+        }
+
+        const auditData = auditResult.rows[0];
+
+        res.json({
+            success: true,
+            message: 'Registro forense recuperado con éxito.',
+            audit_record: {
+                id: auditData.id,
+                response_id: auditData.response_id,
+                origin: auditData.origin_coords,
+                destination: auditData.destination_coords,
+                final_risk_score: auditData.final_risk_score,
+                alerts_triggered: auditData.alerts_triggered,
+                applied_context: auditData.applied_context,
+                vehicle_snapshot: auditData.vehicle_snapshot,
+                rules_snapshot: auditData.rules_snapshot,
+                decision_hash: auditData.decision_hash,
+                decision_timestamp: auditData.decision_timestamp
+            }
+        });
+
+    } catch (error) {
+        error.statusCode = 500;
+        next(error);
+    }
+});
+
+// ==========================================
 // DÍA 16 - 28: RIESGOS FÍSICOS Y CAJA NEGRA CON HASH INMUTABLE
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
@@ -556,7 +600,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             strContext,
             strVehicle,
             strRules,
-            decisionHash // <-- DÍA 28 INYECTADO
+            decisionHash 
         ]);
         // ==========================================
         
@@ -592,5 +636,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Caja Negra con Hash Criptográfico (Día 28) activa en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Caja Negra con Hash Criptográfico y Auditoría (Día 29) activa en puerto ${port}`);
 });
