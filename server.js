@@ -176,7 +176,6 @@ const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, del
     const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary&apikey=${apiKey}`;
 
     try {
-        // OPERACIÓN ESCUDO: Timeout estricto de 5 segundos
         const response = await axios.get(url, { timeout: 5000 });
         return response.data;
     } catch (error) {
@@ -337,7 +336,7 @@ app.get('/api/route/:id', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 16 - 24: RIESGOS FÍSICOS, AMBIENTALES Y RESTRICCIONES HORARIAS
+// DÍA 16 - 26: RIESGOS FÍSICOS Y CAJA NEGRA LEGAL
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const { origin, destination, height_m, weight_t, euro_standard, country_code, departure_time } = req.body;
@@ -354,9 +353,6 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
     try {
         console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta con matriz 3D. Salida: ${startTime.toISOString()}`);
         
-        // ==========================================
-        // OPERACIÓN ESCUDO: CACHÉ INTELIGENTE DE RUTAS
-        // ==========================================
         const routeKey = crypto.createHash('sha256').update(`${origin}_${destination}_${truckHeight}_${truckWeight}_${truckEuro}`).digest('hex');
         let routeData;
         
@@ -369,13 +365,11 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             console.log(`[INFO] [TxID: ${req.correlationId}] 📡 Consultando HERE API (Nueva ruta)...`);
             routeData = await fetchRouteFromHEREWithRetry(origin, destination);
             
-            // Guardamos en la bóveda de caché para el futuro de forma no bloqueante
             await pool.query(
                 'INSERT INTO route_cache (route_key, raw_response) VALUES ($1, $2) ON CONFLICT (route_key) DO NOTHING', 
                 [routeKey, routeData]
             );
         }
-        // ==========================================
         
         const insertQuery = `
             INSERT INTO provider_responses (origin_coords, destination_coords, raw_data)
@@ -422,12 +416,10 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const segmentTime = new Date(startTime.getTime() + (accumulatedDurationSeconds * 1000));
                 const segmentHour = segmentTime.getHours();
 
-                // --- RADAR URBANO (Día 22) ---
                 const speedMps = durationSeconds > 0 ? (lengthMeters / durationSeconds) : 0;
                 const isUrbanDense = (speedMps > 0 && speedMps < 13.88);
                 if (isUrbanDense) routeTouchesUrban = true;
 
-                // --- 1. RIESGO DE ALTURA ---
                 let segmentHeightLimit = 5.0; 
                 if (section.notices && section.notices.some(n => n.title.includes('height'))) {
                     segmentHeightLimit = truckHeight + 0.10; 
@@ -438,7 +430,6 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 else if (heightMargin <= 0.05) heightRiskScore = 100;
                 else heightRiskScore = Math.round(((0.50 - heightMargin) / (0.50 - 0.05)) * 100);
 
-                // --- 2. RIESGO DE PESO ---
                 let segmentWeightLimit = 44.0;
                 if (section.notices && section.notices.some(n => n.title.includes('weight'))) {
                     segmentWeightLimit = truckWeight + 0.5;
@@ -449,7 +440,6 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 else if (weightMargin <= 0.5) weightRiskScore = 100;
                 else weightRiskScore = Math.round(((5.0 - weightMargin) / (5.0 - 0.5)) * 100);
 
-                // --- 3. RIESGO AMBIENTAL (ZBE) ---
                 let environmentalRiskScore = 0;
                 if (isUrbanDense && requiredEuro > 0) {
                     if (truckEuro < requiredEuro) {
@@ -460,19 +450,16 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                     }
                 }
 
-                // --- 4. RESTRICCIONES HORARIAS (DÍA 24) ---
                 let timeRestrictionRiskScore = 0;
                 if (isUrbanDense && (segmentHour >= 22 || segmentHour < 6)) {
                     timeRestrictionRiskScore = 100;
                     timeAlert = true;
                 }
 
-                // --- 5. VEREDICTO FINAL: PRINCIPIO DE MÁXIMO PELIGRO ---
                 const physicalRiskScore = Math.max(heightRiskScore, weightRiskScore);
                 const contextualRiskScore = Math.max(environmentalRiskScore, timeRestrictionRiskScore);
                 const totalSegmentScore = Math.max(physicalRiskScore, contextualRiskScore);
 
-                // --- ACUMULACIÓN PARA LA PONDERACIÓN ---
                 totalRouteLength += lengthMeters;
                 totalRiskWeighted += (totalSegmentScore * lengthMeters);
 
@@ -512,22 +499,46 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             WHERE id = $2
         `;
         await pool.query(updateRouteQuery, [finalRouteRisk, savedId]);
+
+        // ==========================================
+        // DÍA 26: LA CAJA NEGRA LEGAL (NOTARIO DIGITAL)
+        // ==========================================
+        console.log(`[INFO] [TxID: ${req.correlationId}] ⚖️ Sellando decisión en la Caja Negra Legal (Día 26)...`);
+        
+        const logQuery = `
+            INSERT INTO route_decision_logs (
+                response_id, origin_coords, destination_coords, 
+                final_risk_score, alerts_triggered, applied_context
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+        `;
+        const alertsObj = { 
+            urban_zone: routeTouchesUrban, 
+            environmental_multa: environmentalAlert, 
+            time_restriction: timeAlert 
+        };
+        const contextObj = { 
+            euro_standard: truckEuro, 
+            departure_time: startTime.toISOString() 
+        };
+        
+        await pool.query(logQuery, [
+            savedId,
+            origin,
+            destination,
+            finalRouteRisk,
+            alertsObj,
+            contextObj
+        ]);
+        // ==========================================
         
         res.json({
             success: true,
-            message: 'Ruta calculada con análisis total de la matriz de riesgos.',
+            message: 'Ruta calculada y decisión sellada en la Caja Negra (Día 26).',
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             final_route_risk: finalRouteRisk,
-            alerts: {
-                urban_zone: routeTouchesUrban,
-                environmental_multa: environmentalAlert,
-                time_restriction: timeAlert 
-            },
-            applied_context: {
-                euro_standard: truckEuro,
-                departure_time: startTime.toISOString()
-            },
+            alerts: alertsObj,
+            applied_context: contextObj,
             data: routeData
         });
     } catch (error) {
@@ -547,5 +558,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Operación Escudo Activa en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Caja Negra Legal Activa (Día 26) en puerto ${port}`);
 });
