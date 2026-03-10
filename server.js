@@ -380,6 +380,58 @@ app.get('/api/legal/audit/:response_id', authenticateJWT, async (req, res, next)
 });
 
 // ==========================================
+// DÍA 30: AUDITORÍA INTERNA DE COHERENCIA (DETECTOR DE MENTIRAS)
+// ==========================================
+app.get('/api/legal/verify/:response_id', authenticateJWT, async (req, res, next) => {
+    const responseId = req.params.response_id;
+
+    try {
+        console.log(`[INFO] [TxID: ${req.correlationId}] 🚨 Ejecutando Auditoría de Coherencia para la ruta ID: ${responseId}`);
+
+        const auditResult = await pool.query(
+            'SELECT * FROM route_decision_logs WHERE response_id = $1',
+            [responseId]
+        );
+
+        if (auditResult.rowCount === 0) {
+            return res.status(404).json({ success: false, error: 'Registro de auditoría no encontrado.' });
+        }
+
+        const auditData = auditResult.rows[0];
+
+        // 1. Reconstruimos los JSON idénticos a como se guardaron
+        const strAlerts = JSON.stringify(auditData.alerts_triggered);
+        const strContext = JSON.stringify(auditData.applied_context);
+        const strVehicle = JSON.stringify(auditData.vehicle_snapshot);
+        const strRules = JSON.stringify(auditData.rules_snapshot);
+
+        // 2. Reconstruimos la cadena de texto exacta para la firma
+        const payloadToHash = `${auditData.response_id}_${auditData.origin_coords}_${auditData.destination_coords}_${auditData.final_risk_score}_${strAlerts}_${strContext}_${strVehicle}_${strRules}`;
+        
+        // 3. Volvemos a pasar el contenido por la batidora SHA-256
+        const currentHash = crypto.createHash('sha256').update(payloadToHash).digest('hex');
+
+        // 4. El momento de la verdad: ¿Coincide la firma actual con el candado que guardamos el Día 28?
+        const isIntact = currentHash === auditData.decision_hash;
+
+        res.json({
+            success: true,
+            audit_status: isIntact ? "Íntegro y válido" : "¡ALERTA ROJA! Registro manipulado",
+            is_valid: isIntact,
+            original_hash: auditData.decision_hash,
+            recalculated_hash: currentHash,
+            message: isIntact 
+                ? 'El registro forense está intacto, no ha sido alterado y es legalmente vinculante ante un tribunal.' 
+                : 'Peligro: El registro ha sido alterado manualmente en la base de datos tras su creación original.'
+        });
+
+    } catch (error) {
+        error.statusCode = 500;
+        next(error);
+    }
+});
+
+// ==========================================
 // DÍA 16 - 28: RIESGOS FÍSICOS Y CAJA NEGRA CON HASH INMUTABLE
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
@@ -636,5 +688,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Caja Negra con Hash Criptográfico y Auditoría (Día 29) activa en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Caja Negra 100% Auditada (Día 30) activa en puerto ${port}`);
 });
