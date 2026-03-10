@@ -526,8 +526,8 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             origin,
             destination,
             finalRouteRisk,
-            alertsObj,
-            contextObj
+            JSON.stringify(alertsObj), // <-- CORRECCIÓN: Evitamos el [object Object]
+            JSON.stringify(contextObj) // <-- CORRECCIÓN: Formato perfecto para JSONB
         ]);
         // ==========================================
         
@@ -550,6 +550,11 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 // 6. MANEJO GLOBAL DE EXCEPCIONES
 app.use((err, req, res, next) => {
     const statusCode = err.statusCode || 500;
+    
+    // AÑADIDO: Visión láser para la arquitecta si algo falla.
+    console.error(`❌ [ERROR FATAL] TxID: ${req.correlationId || 'N/A'}`);
+    console.error(err.stack);
+    
     res.status(statusCode).json({
         success: false,
         error: environment === 'production' ? 'Error interno.' : err.message,
