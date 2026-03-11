@@ -204,10 +204,10 @@ const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, del
 };
 
 // ==========================================
-// DÍA 37 y 38: RADAR DE PARKINGS SEGUROS (MOCK B2B) Y SIMULACIÓN DE VACÍO
+// DÍA 37 y 38: RADAR DE PARKINGS SEGUROS (MOCK B2B)
 // ==========================================
 const findSafeParkings = async (coords, forceEmpty = false) => {
-    if (!coords || forceEmpty) return []; // DÍA 38: Si el desierto es total, devolvemos vacío.
+    if (!coords || forceEmpty) return []; 
     
     const parts = coords.split(',');
     const lat = parseFloat(parts[0]);
@@ -479,40 +479,16 @@ app.get('/api/legal/verify/:response_id', authenticateJWT, async (req, res, next
 });
 
 // ==========================================
-// DÍA 31: BLOQUE 3 - GESTIÓN DE SESIONES DEL CONDUCTOR (TACÓGRAFO)
+// DÍA 31: BLOQUE 3 - GESTIÓN DE SESIONES (TACÓGRAFO)
 // ==========================================
 app.post('/api/sessions/start', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
-        const checkActive = await pool.query(
-            'SELECT id FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
-            [userId]
-        );
-
-        if (checkActive.rowCount > 0) {
-            return res.json({ 
-                success: true, 
-                message: 'Ya existe una sesión activa. Recuperando datos...', 
-                session_id: checkActive.rows[0].id 
-            });
-        }
-
-        const result = await pool.query(
-            'INSERT INTO driver_sessions (user_id, current_status) VALUES ($1, $2) RETURNING id, start_time',
-            [userId, 'OFF']
-        );
-
-        console.log(`[INFO] [TxID: ${req.correlationId}] 🚛 Sesión iniciada para conductor ${userId}`);
-        
-        res.status(201).json({
-            success: true,
-            message: 'Jornada iniciada con éxito.',
-            session_id: result.rows[0].id,
-            start_time: result.rows[0].start_time
-        });
-    } catch (error) {
-        next(error);
-    }
+        // En una simulación, si el usuario hace Start, matamos la sesión anterior para empezar limpios
+        await pool.query('UPDATE driver_sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = $1 AND end_time IS NULL', [userId]);
+        const result = await pool.query('INSERT INTO driver_sessions (user_id, current_status) VALUES ($1, $2) RETURNING id, start_time', [userId, 'OFF']);
+        res.status(201).json({ success: true, session_id: result.rows[0].id });
+    } catch (error) { next(error); }
 });
 
 app.post('/api/sessions/stop', authenticateJWT, async (req, res, next) => {
@@ -566,6 +542,30 @@ app.get('/api/sessions/status', authenticateJWT, async (req, res, next) => {
     } catch (error) {
         next(error);
     }
+});
+
+// ==========================================
+// DÍA 39: EL CONDENSADOR DE FLUZO (MÁQUINA DEL TIEMPO B2B)
+// ==========================================
+app.post('/api/sessions/debug/time-jump', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    const { hours_to_jump } = req.body; 
+    try {
+        if (!hours_to_jump) return res.status(400).json({error: 'Faltan horas'});
+        
+        const result = await pool.query(
+            `UPDATE driver_sessions 
+             SET last_status_change = last_status_change - INTERVAL '${hours_to_jump} hours' 
+             WHERE user_id = $1 AND end_time IS NULL 
+             RETURNING current_status, last_status_change`,
+            [userId]
+        );
+        
+        if (result.rowCount === 0) return res.status(404).json({error: 'Sin jornada activa'});
+        
+        console.log(`[INFO] ⏱️ Viaje en el tiempo: +${hours_to_jump}h simuladas en estado ${result.rows[0].current_status}`);
+        res.json({ success: true, message: `Has viajado +${hours_to_jump} horas hacia el futuro en tu turno.` });
+    } catch (error) { next(error); }
 });
 
 // ==========================================
@@ -857,11 +857,10 @@ app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 16 - 38: RIESGOS, CAJA NEGRA Y PENALIZADOR DE RUTAS INVIABLES (DÍA 38)
+// DÍA 16 - 38: RIESGOS FÍSICOS, CAJA NEGRA, TIEMPO RESTANTE Y PENALIZADOR DE RUTAS (DÍA 38)
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1; 
-    // Añadimos el interruptor force_no_parking para probar el desastre sin irnos al desierto
     const { origin, destination, height_m, weight_t, euro_standard, country_code, departure_time, force_no_parking } = req.body;
     const truckHeight = height_m || 4.0; 
     const truckWeight = weight_t || 40.0; 
@@ -918,15 +917,8 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
-        let segmentosGuardados = 0;
-        let totalRiskWeighted = 0;
-        let totalRouteLength = 0;
-        let routeTouchesUrban = false; 
-        let environmentalAlert = false;
-        let timeAlert = false; 
-        let accumulatedDurationSeconds = 0; 
-        let interceptCoords = null; 
-
+        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando Zonas Ambientales y Punto de Intercepción (Parkings)...`);
+        
         const zoneResult = await pool.query('SELECT * FROM environmental_zones WHERE country_code = $1', [targetCountry]);
         const activeZones = zoneResult.rows;
         let requiredEuro = 0;
@@ -934,13 +926,28 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             requiredEuro = Math.max(...activeZones.map(z => z.min_euro_standard));
         }
 
+        let segmentosGuardados = 0;
+        let totalRiskWeighted = 0;
+        let totalRouteLength = 0;
+        let routeTouchesUrban = false; 
+        let environmentalAlert = false;
+        let timeAlert = false; 
+        
+        let accumulatedDurationSeconds = 0; 
+        let interceptCoords = null; 
+
         if (routeData.routes && routeData.routes.length > 0) {
             const sections = routeData.routes[0].sections;
+            
             for (let i = 0; i < sections.length; i++) {
                 const section = sections[i];
                 
-                const startCoords = section.departure?.place?.location ? `${section.departure.place.location.lat},${section.departure.place.location.lng}` : origin;
-                const endCoords = section.arrival?.place?.location ? `${section.arrival.place.location.lat},${section.arrival.place.location.lng}` : destination;
+                const startCoords = section.departure?.place?.location 
+                    ? `${section.departure.place.location.lat},${section.departure.place.location.lng}` 
+                    : origin;
+                const endCoords = section.arrival?.place?.location 
+                    ? `${section.arrival.place.location.lat},${section.arrival.place.location.lng}` 
+                    : destination;
                 const lengthMeters = section.summary?.length || 0;
                 const durationSeconds = section.summary?.duration || 0;
 
@@ -948,6 +955,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 
                 if (timeLimitToUse > 0 && accumulatedDurationSeconds >= timeLimitToUse && !interceptCoords) {
                     interceptCoords = endCoords; 
+                    console.log(`[INFO] [TxID: ${req.correlationId}] 🎯 Punto crítico interceptado: ${interceptCoords}`);
                 }
 
                 const segmentTime = new Date(startTime.getTime() + (accumulatedDurationSeconds * 1000));
@@ -958,7 +966,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 if (isUrbanDense) routeTouchesUrban = true;
 
                 let segmentHeightLimit = 5.0; 
-                if (section.notices && section.notices.some(n => n.title.includes('height'))) segmentHeightLimit = truckHeight + 0.10; 
+                if (section.notices && section.notices.some(n => n.title.includes('height'))) {
+                    segmentHeightLimit = truckHeight + 0.10; 
+                }
                 const heightMargin = segmentHeightLimit - truckHeight;
                 let heightRiskScore = 0;
                 if (heightMargin >= 0.50) heightRiskScore = 0;
@@ -966,7 +976,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 else heightRiskScore = Math.round(((0.50 - heightMargin) / (0.50 - 0.05)) * 100);
 
                 let segmentWeightLimit = 44.0;
-                if (section.notices && section.notices.some(n => n.title.includes('weight'))) segmentWeightLimit = truckWeight + 0.5;
+                if (section.notices && section.notices.some(n => n.title.includes('weight'))) {
+                    segmentWeightLimit = truckWeight + 0.5;
+                }
                 const weightMargin = segmentWeightLimit - truckWeight;
                 let weightRiskScore = 0;
                 if (weightMargin >= 5.0) weightRiskScore = 0;
@@ -975,12 +987,19 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
                 let environmentalRiskScore = 0;
                 if (isUrbanDense && requiredEuro > 0) {
-                    if (truckEuro < requiredEuro) { environmentalRiskScore = 100; environmentalAlert = true; }
-                    else if (truckEuro === requiredEuro) { environmentalRiskScore = 30; }
+                    if (truckEuro < requiredEuro) {
+                        environmentalRiskScore = 100; 
+                        environmentalAlert = true;
+                    } else if (truckEuro === requiredEuro) {
+                        environmentalRiskScore = 30;  
+                    }
                 }
 
                 let timeRestrictionRiskScore = 0;
-                if (isUrbanDense && (segmentHour >= 22 || segmentHour < 6)) { timeRestrictionRiskScore = 100; timeAlert = true; }
+                if (isUrbanDense && (segmentHour >= 22 || segmentHour < 6)) {
+                    timeRestrictionRiskScore = 100;
+                    timeAlert = true;
+                }
 
                 const physicalRiskScore = Math.max(heightRiskScore, weightRiskScore);
                 const contextualRiskScore = Math.max(environmentalRiskScore, timeRestrictionRiskScore);
@@ -995,9 +1014,24 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                         length_meters, duration_seconds, height_margin_m, 
                         physical_risk_score, weight_margin_t, total_segment_score,
                         is_urban_dense, environmental_risk_score, time_restriction_risk_score
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 `;
-                await pool.query(segmentQuery, [ savedId, i + 1, startCoords, endCoords, lengthMeters, durationSeconds, heightMargin, physicalRiskScore, weightMargin, totalSegmentScore, isUrbanDense, environmentalRiskScore, timeRestrictionRiskScore ]);
+                await pool.query(segmentQuery, [
+                    savedId, 
+                    i + 1, 
+                    startCoords, 
+                    endCoords, 
+                    lengthMeters, 
+                    durationSeconds, 
+                    heightMargin, 
+                    physicalRiskScore,
+                    weightMargin,
+                    totalSegmentScore,
+                    isUrbanDense,
+                    environmentalRiskScore,
+                    timeRestrictionRiskScore 
+                ]);
                 segmentosGuardados++;
             }
         }
@@ -1009,25 +1043,20 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
         let legalRouteAlert = null;
         let suggestedParkings = [];
-        let isRouteViable = true; // DÍA 38: Por defecto asumimos que se puede hacer
+        let isRouteViable = true; 
 
         if (exceedsContinuous || exceedsDaily) {
             legalRouteAlert = `¡ALERTA LEGAL! Esta ruta dura ${Math.floor(accumulatedDurationSeconds / 3600)}h ${Math.floor((accumulatedDurationSeconds % 3600) / 60)}m, pero tu tacógrafo exige pausa antes. Deberás detenerte en el camino.`;
             
             if (interceptCoords) {
-                // Pasamos el force_no_parking al radar para simular que no hay parkings
                 suggestedParkings = await findSafeParkings(interceptCoords, force_no_parking === true);
             }
 
-            // ==========================================
-            // DÍA 38: EL MARTILLO PENALIZADOR
-            // ==========================================
             if (suggestedParkings.length === 0) {
-                isRouteViable = false; // ¡Ruta Bloqueada!
-                finalRouteRisk = finalRouteRisk === 0 ? 100 : finalRouteRisk * 10; // Disparamos el riesgo x10
+                isRouteViable = false; 
+                finalRouteRisk = finalRouteRisk === 0 ? 100 : finalRouteRisk * 10; 
                 
                 legalRouteAlert = `¡BLOQUEO DE SISTEMA! Superas el límite legal y NO hay parkings seguros en la zona de intercepción. Riesgo de multa inminente. RUTA INVIABLE.`;
-                console.warn(`🚨 [DÍA 38] RUTA BLOQUEADA para TxID: ${req.correlationId} - Cero opciones de descanso viable.`);
             }
         }
 
@@ -1038,7 +1067,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         `;
         await pool.query(updateRouteQuery, [finalRouteRisk, savedId]);
 
-        console.log(`[INFO] [TxID: ${req.correlationId}] 🔐 Generando Hash Criptográfico Inmutable...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] 🔐 Generando Hash Criptográfico Inmutable (Día 28)...`);
         
         const alertsObj = { 
             urban_zone: routeTouchesUrban, 
@@ -1046,14 +1075,27 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             time_restriction: timeAlert,
             route_exceeds_continuous_driving_limit: exceedsContinuous, 
             route_exceeds_daily_driving_limit: exceedsDaily,
-            route_is_viable: isRouteViable, // Día 38
-            no_safe_parking_found: !isRouteViable // Día 38
+            route_is_viable: isRouteViable,
+            no_safe_parking_found: !isRouteViable 
         };
-        const contextObj = { euro_standard: truckEuro, departure_time: startTime.toISOString() };
-        const vehicleSnapshotObj = { height_m: truckHeight, weight_t: truckWeight, euro_standard: truckEuro };
+        const contextObj = { 
+            euro_standard: truckEuro, 
+            departure_time: startTime.toISOString() 
+        };
+
+        const vehicleSnapshotObj = {
+            height_m: truckHeight,
+            weight_t: truckWeight,
+            euro_standard: truckEuro
+        };
+
         const rulesSnapshotObj = {
-            country_code: targetCountry, required_euro_zone: requiredEuro, height_safety_buffer_m: 0.5,
-            weight_safety_buffer_t: 5.0, night_restriction_start_hour: 22, night_restriction_end_hour: 6
+            country_code: targetCountry,
+            required_euro_zone: requiredEuro,
+            height_safety_buffer_m: 0.5,
+            weight_safety_buffer_t: 5.0,
+            night_restriction_start_hour: 22,
+            night_restriction_end_hour: 6
         };
         
         const strAlerts = sortJSON(alertsObj);
@@ -1066,11 +1108,23 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         
         const logQuery = `
             INSERT INTO route_decision_logs (
-                response_id, origin_coords, destination_coords, final_risk_score, alerts_triggered, 
-                applied_context, vehicle_snapshot, rules_snapshot, decision_hash
+                response_id, origin_coords, destination_coords, 
+                final_risk_score, alerts_triggered, applied_context,
+                vehicle_snapshot, rules_snapshot, decision_hash
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `;
-        await pool.query(logQuery, [ savedId, origin, destination, finalRouteRisk, strAlerts, strContext, strVehicle, strRules, decisionHash ]);
+        
+        await pool.query(logQuery, [
+            savedId,
+            origin,
+            destination,
+            finalRouteRisk,
+            strAlerts,
+            strContext,
+            strVehicle,
+            strRules,
+            decisionHash 
+        ]);
         
         res.json({
             success: true,
@@ -1107,5 +1161,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - El Martillo Penalizador (Día 38) activo en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Motor B2B Completo + Condensador de Fluzo activo en puerto ${port}`);
 });
