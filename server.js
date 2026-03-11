@@ -103,7 +103,7 @@ app.post('/api/auth/token', (req, res) => {
     // OPERACIÓN ESCUDO: Validación estricta sin fallbacks
     if (api_key === API_KEY) {
         const token = jwt.sign(
-            { role: 'truck_client', access: 'fleet_data', user_id: 1 }, // Añadido user_id: 1 para el Tacógrafo
+            { role: 'truck_client', access: 'fleet_data', user_id: 1 }, 
             JWT_SECRET,
             { expiresIn: '2h' } 
         );
@@ -535,6 +535,83 @@ app.get('/api/sessions/status', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
+// DÍA 32: RADAR AUTOMÁTICO DE CONDUCCIÓN (> X KM/H)
+// ==========================================
+app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    const { speed_kmh } = req.body;
+    const currentSpeed = speed_kmh || 0;
+
+    try {
+        // 1. Localizar la jornada activa del conductor
+        const sessionResult = await pool.query(
+            'SELECT * FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
+            [userId]
+        );
+
+        if (sessionResult.rowCount === 0) {
+            return res.status(404).json({ success: false, error: 'No se encontró jornada activa para reportar telemetría.' });
+        }
+
+        const session = sessionResult.rows[0];
+        const now = new Date();
+        const lastChange = new Date(session.last_status_change);
+        
+        // 2. ¿Cuántos segundos han pasado desde la última vez que el servidor actualizó el estado?
+        const secondsElapsed = Math.floor((now - lastChange) / 1000);
+
+        let newStatus = session.current_status;
+        let addedSeconds = 0;
+        let totalDrivingSeconds = session.accumulated_driving_seconds;
+
+        // 3. Lógica pura del Tacógrafo: ¿Va el camión a más de 10 km/h?
+        if (currentSpeed > 10) {
+            if (session.current_status === 'DRIVING') {
+                // Sigue en marcha: sumar los segundos transcurridos al acumulador legal
+                addedSeconds = secondsElapsed;
+                totalDrivingSeconds += addedSeconds;
+            } else {
+                // El camión acaba de arrancar: Cambiamos estado sin sumar todavía
+                newStatus = 'DRIVING';
+            }
+        } else {
+            if (session.current_status === 'DRIVING') {
+                // El camión acaba de detenerse: sumar el último tramo y poner a descansar
+                addedSeconds = secondsElapsed;
+                totalDrivingSeconds += addedSeconds;
+                newStatus = 'RESTING';
+            } else {
+                // Sigue detenido, no hacemos nada con el reloj de conducción
+                newStatus = session.current_status === 'OFF' ? 'OFF' : 'RESTING'; 
+            }
+        }
+
+        // 4. Si el conductor se movió o cambió de estado, actualizamos la base de datos
+        if (addedSeconds > 0 || newStatus !== session.current_status) {
+            await pool.query(
+                'UPDATE driver_sessions SET current_status = $1, accumulated_driving_seconds = $2, last_status_change = CURRENT_TIMESTAMP WHERE id = $3',
+                [newStatus, totalDrivingSeconds, session.id]
+            );
+        }
+
+        res.json({
+            success: true,
+            message: 'Telemetría registrada y analizada.',
+            telemetry: {
+                current_speed_kmh: currentSpeed,
+                previous_status: session.current_status,
+                new_status: newStatus,
+                seconds_added_to_driving: addedSeconds,
+                total_driving_seconds: totalDrivingSeconds
+            }
+        });
+
+    } catch (error) {
+        next(error);
+    }
+});
+
+// ==========================================
 // DÍA 16 - 28: RIESGOS FÍSICOS Y CAJA NEGRA CON HASH INMUTABLE
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
@@ -793,5 +870,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Caja Negra y Tacógrafo (Día 31) activos en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Radar Automático (Día 32) activo en puerto ${port}`);
 });
