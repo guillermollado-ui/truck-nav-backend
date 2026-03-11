@@ -41,14 +41,9 @@ exports.timeJump = async (req, res, next) => {
     } catch (error) { next(error); }
 };
 
-// ==========================================
-// DÍA 40 Y 43: TELEMETRÍA AVANZADA + AUTO-FRENADO PASIVO
-// ==========================================
 exports.telemetry = async (req, res, next) => {
     const userId = req.user.user_id || 1;
     const currentSpeed = req.body.speed_kmh || 0;
-    
-    // DÍA 43: Parámetros nuevos para la Inteligencia Pasiva
     const prevSpeed = req.body.prev_speed_kmh;
     const lat = req.body.lat;
     const lon = req.body.lon;
@@ -72,7 +67,6 @@ exports.telemetry = async (req, res, next) => {
         let contDriving = session.continuous_driving_seconds || 0;
         let isTunnel = false;
         
-        // Túneles (Día 40)
         if (secondsElapsed > 120 && session.current_status === 'DRIVING' && currentSpeed > 10) isTunnel = true;
 
         if (currentSpeed > 10) {
@@ -91,21 +85,50 @@ exports.telemetry = async (req, res, next) => {
         }
 
         // ==========================================
-        // DÍA 43: DETECCIÓN AUTOMÁTICA DE FRENADO (MINERÍA PASIVA)
+        // DÍA 43, 44 Y 45: MINERÍA PASIVA Y CONSENSO
         // ==========================================
         let autoHazardCreated = false;
         if (prevSpeed !== undefined && lat && lon) {
             const speedDrop = prevSpeed - currentSpeed;
-            // Si la caída de velocidad es de 20 km/h o más entre pings
             if (speedDrop >= 20) {
-                console.log(`[INFO] [TxID: ${req.correlationId}] 🚨 AUTO-FRENADO DETECTADO: Caída de ${speedDrop} km/h en ${lat},${lon}. Generando inteligencia...`);
+                const confidenceAdded = 15;
                 
-                const hazardQuery = `
-                    INSERT INTO hazard_candidates (lat, lon, geom, type, source, confidence_score)
-                    VALUES ($1, $2, ST_SetSRID(ST_MakePoint($2, $1), 4326), $3, $4, $5)
+                // Búsqueda espacial de un frenazo previo en 100 metros
+                const searchCmd = `
+                    SELECT id, confidence_score, report_count
+                    FROM hazard_candidates
+                    WHERE type = 'brake_hotspot'
+                    AND ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography, 100)
+                    AND last_seen > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                    FOR UPDATE
                 `;
-                // Fuente: auto_braking | Confianza Base: 15 (un poco menor que reporte humano)
-                await client.query(hazardQuery, [lat, lon, 'brake_hotspot', 'auto_braking', 15]);
+                const searchRes = await client.query(searchCmd, [lat, lon]);
+
+                if (searchRes.rowCount > 0) {
+                    // Ya existía un frenazo aquí. ¡Fusionamos!
+                    const existing = searchRes.rows[0];
+                    const newScore = existing.confidence_score + confidenceAdded;
+                    const newCount = existing.report_count + 1;
+                    let newStatus = 'unverified';
+
+                    if (newCount >= 3 || newScore >= 60) newStatus = 'verified_hazard';
+                    else if (newScore >= 30) newStatus = 'probable';
+
+                    await client.query(`
+                        UPDATE hazard_candidates
+                        SET confidence_score = $1, report_count = $2, status = $3, last_seen = CURRENT_TIMESTAMP
+                        WHERE id = $4
+                    `, [newScore, newCount, newStatus, existing.id]);
+                    console.log(`[INFO] [TxID: ${req.correlationId}] 🤝 Consenso Pasivo: Atasco en ${lat},${lon} sube a score ${newScore}. Status: ${newStatus}`);
+                } else {
+                    // Primer frenazo en esta zona
+                    const insertCmd = `
+                        INSERT INTO hazard_candidates (lat, lon, geom, type, source, confidence_score, status)
+                        VALUES ($1, $2, ST_SetSRID(ST_MakePoint($2, $1), 4326), 'brake_hotspot', 'auto_braking', $3, 'unverified')
+                    `;
+                    await client.query(insertCmd, [lat, lon, confidenceAdded]);
+                    console.log(`[INFO] [TxID: ${req.correlationId}] 🚨 AUTO-FRENADO DETECTADO: Nuevo punto caliente creado en ${lat},${lon}`);
+                }
                 autoHazardCreated = true;
             }
         }
@@ -118,7 +141,7 @@ exports.telemetry = async (req, res, next) => {
                 new_status: newStatus, 
                 continuous_driving_seconds: contDriving, 
                 tunnel_recovery_applied: isTunnel,
-                passive_hazard_detected: autoHazardCreated // Avisamos a la app de que cazamos el frenazo
+                passive_hazard_detected: autoHazardCreated
             } 
         });
     } catch (error) {
