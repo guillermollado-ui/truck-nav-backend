@@ -203,6 +203,51 @@ const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, del
     }
 };
 
+// ==========================================
+// DÍA 37: RADAR DE PARKINGS SEGUROS (MOCK B2B)
+// ==========================================
+const findSafeParkings = async (coords) => {
+    if (!coords) return [];
+    
+    // En un entorno de producción B2B, aquí se consultaría la API de Parkings de HERE 
+    // o una base de datos propia de POIs logísticos. Para el MVP simulamos la respuesta geolocalizada.
+    const parts = coords.split(',');
+    const lat = parseFloat(parts[0]);
+    const lng = parseFloat(parts[1]);
+    
+    if (isNaN(lat) || isNaN(lng)) return [];
+
+    return [
+        {
+            id: crypto.randomUUID(),
+            name: "TruckNav Premium SafeHaven",
+            location: `${(lat + 0.015).toFixed(4)},${(lng + 0.010).toFixed(4)}`,
+            security_level: "Gold (CCTV 24/7 + Vallado)",
+            available_spots: 12,
+            amenities: ["Duchas limpias", "Restaurante 24h", "Wifi Alta Velocidad"],
+            distance_to_route_km: 1.2
+        },
+        {
+            id: crypto.randomUUID(),
+            name: "Logistics Rest Area B2B",
+            location: `${(lat - 0.010).toFixed(4)},${(lng - 0.020).toFixed(4)}`,
+            security_level: "Silver (Vigilancia nocturna)",
+            available_spots: 4,
+            amenities: ["Cafetería", "Aseos básicos"],
+            distance_to_route_km: 2.5
+        },
+        {
+            id: crypto.randomUUID(),
+            name: "Gas Station & Truck Stop",
+            location: `${(lat + 0.025).toFixed(4)},${(lng - 0.005).toFixed(4)}`,
+            security_level: "Bronze (Iluminación estándar)",
+            available_spots: 22,
+            amenities: ["Gasolinera", "Tienda", "Aseos"],
+            distance_to_route_km: 0.8
+        }
+    ];
+};
+
 // 5. RUTAS PROTEGIDAS
 app.get('/api/vehicles', authenticateJWT, async (req, res, next) => {
     try {
@@ -814,10 +859,10 @@ app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 16 - 36: RIESGOS FÍSICOS, CAJA NEGRA Y DETECCIÓN DE TIEMPO RESTANTE
+// DÍA 16 - 37: RIESGOS FÍSICOS, CAJA NEGRA, TIEMPO RESTANTE Y RADAR DE PARKINGS (DÍA 37)
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
-    const userId = req.user.user_id || 1; // Extraemos al chofer para mirar su tacógrafo
+    const userId = req.user.user_id || 1; 
     const { origin, destination, height_m, weight_t, euro_standard, country_code, departure_time } = req.body;
     const truckHeight = height_m || 4.0; 
     const truckWeight = weight_t || 40.0; 
@@ -832,7 +877,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
     try {
         console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta con matriz 3D. Salida: ${startTime.toISOString()}`);
         
-        // 1. Miramos el Tacógrafo del chofer ANTES de autorizar la ruta (DÍA 36)
+        // 1. Miramos el Tacógrafo del chofer
         let continuousRemainingSeconds = 4.5 * 3600;
         let dailyRemainingSeconds = 9 * 3600;
 
@@ -846,6 +891,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             continuousRemainingSeconds = Math.max(0, (4.5 * 3600) - (session.continuous_driving_seconds || 0));
             dailyRemainingSeconds = Math.max(0, (9 * 3600) - (session.accumulated_driving_seconds || 0));
         }
+        
+        // Calculamos el tiempo límite que manda: el continuo o el diario, el que sea menor y > 0
+        let timeLimitToUse = Math.min(continuousRemainingSeconds, dailyRemainingSeconds);
         
         const routeKey = crypto.createHash('sha256').update(`${origin}_${destination}_${truckHeight}_${truckWeight}_${truckEuro}`).digest('hex');
         let routeData;
@@ -873,7 +921,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const dbResult = await pool.query(insertQuery, [origin, destination, routeData]);
         const savedId = dbResult.rows[0].id;
         
-        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando Zonas Ambientales y Restricciones de Reloj...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] Evaluando Zonas Ambientales, Restricciones de Reloj y Punto de Intercepción (Parkings)...`);
         
         const zoneResult = await pool.query('SELECT * FROM environmental_zones WHERE country_code = $1', [targetCountry]);
         const activeZones = zoneResult.rows;
@@ -890,6 +938,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         let timeAlert = false; 
         
         let accumulatedDurationSeconds = 0; 
+        
+        // DÍA 37: Variables para el Interceptor de coordenadas
+        let interceptCoords = null; 
 
         if (routeData.routes && routeData.routes.length > 0) {
             const sections = routeData.routes[0].sections;
@@ -907,6 +958,14 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
                 const durationSeconds = section.summary?.duration || 0;
 
                 accumulatedDurationSeconds += durationSeconds;
+                
+                // DÍA 37: LÓGICA DE INTERCEPCIÓN EN RUTA
+                // Si el acumulado supera nuestro límite y aún no hemos pillado la coordenada
+                if (timeLimitToUse > 0 && accumulatedDurationSeconds >= timeLimitToUse && !interceptCoords) {
+                    interceptCoords = endCoords; 
+                    console.log(`[INFO] [TxID: ${req.correlationId}] 🎯 Punto crítico interceptado: ${interceptCoords} a las ${Math.floor(accumulatedDurationSeconds / 3600)}h`);
+                }
+
                 const segmentTime = new Date(startTime.getTime() + (accumulatedDurationSeconds * 1000));
                 const segmentHour = segmentTime.getHours();
 
@@ -988,14 +1047,22 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const finalRouteRisk = totalRouteLength > 0 ? Math.round(totalRiskWeighted / totalRouteLength) : 0;
         
         // ==========================================
-        // DÍA 36: LÓGICA DE DETECCIÓN (MAPA + TACÓGRAFO)
+        // DÍA 36 y 37: LÓGICA DE DETECCIÓN Y BÚSQUEDA DE PARKINGS
         // ==========================================
         let exceedsContinuous = accumulatedDurationSeconds > continuousRemainingSeconds;
         let exceedsDaily = accumulatedDurationSeconds > dailyRemainingSeconds;
 
         let legalRouteAlert = null;
+        let suggestedParkings = [];
+
         if (exceedsContinuous || exceedsDaily) {
             legalRouteAlert = `¡ALERTA LEGAL! Esta ruta dura ${Math.floor(accumulatedDurationSeconds / 3600)}h ${Math.floor((accumulatedDurationSeconds % 3600) / 60)}m, pero tu tacógrafo exige pausa antes. Deberás detenerte en el camino.`;
+            
+            // DÍA 37: Si hay alerta legal y logramos interceptar la coordenada, buscamos los parkings
+            if (interceptCoords) {
+                console.log(`[INFO] [TxID: ${req.correlationId}] 🅿️ Buscando parkings seguros cerca de ${interceptCoords}...`);
+                suggestedParkings = await findSafeParkings(interceptCoords);
+            }
         }
 
         const updateRouteQuery = `
@@ -1014,8 +1081,8 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             urban_zone: routeTouchesUrban, 
             environmental_multa: environmentalAlert, 
             time_restriction: timeAlert,
-            route_exceeds_continuous_driving_limit: exceedsContinuous, // Día 36 Inyectado
-            route_exceeds_daily_driving_limit: exceedsDaily            // Día 36 Inyectado
+            route_exceeds_continuous_driving_limit: exceedsContinuous, 
+            route_exceeds_daily_driving_limit: exceedsDaily            
         };
         const contextObj = { 
             euro_standard: truckEuro, 
@@ -1072,7 +1139,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         res.json({
             success: true,
             message: 'Ruta calculada y sellada criptográficamente.',
-            legal_warning: legalRouteAlert, // DÍA 36: Mensaje directo para el conductor
+            legal_warning: legalRouteAlert, 
+            intercept_point_coords: interceptCoords, // DÍA 37: La coordenada exacta del fin de las horas
+            suggested_parkings: suggestedParkings,   // DÍA 37: Lista de parkings cercanos al corte
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             final_route_risk: finalRouteRisk,
@@ -1102,5 +1171,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Intersección Mapa/Tacógrafo (Día 36) activa en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Radar de Parkings Seguros (Día 37) activo en puerto ${port}`);
 });
