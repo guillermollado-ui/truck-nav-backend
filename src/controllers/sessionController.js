@@ -41,9 +41,18 @@ exports.timeJump = async (req, res, next) => {
     } catch (error) { next(error); }
 };
 
+// ==========================================
+// DÍA 40 Y 43: TELEMETRÍA AVANZADA + AUTO-FRENADO PASIVO
+// ==========================================
 exports.telemetry = async (req, res, next) => {
     const userId = req.user.user_id || 1;
     const currentSpeed = req.body.speed_kmh || 0;
+    
+    // DÍA 43: Parámetros nuevos para la Inteligencia Pasiva
+    const prevSpeed = req.body.prev_speed_kmh;
+    const lat = req.body.lat;
+    const lon = req.body.lon;
+
     const client = await pool.connect(); 
 
     try {
@@ -63,6 +72,7 @@ exports.telemetry = async (req, res, next) => {
         let contDriving = session.continuous_driving_seconds || 0;
         let isTunnel = false;
         
+        // Túneles (Día 40)
         if (secondsElapsed > 120 && session.current_status === 'DRIVING' && currentSpeed > 10) isTunnel = true;
 
         if (currentSpeed > 10) {
@@ -79,8 +89,38 @@ exports.telemetry = async (req, res, next) => {
                 [newStatus, totalDriving, contDriving, session.id]
             );
         }
+
+        // ==========================================
+        // DÍA 43: DETECCIÓN AUTOMÁTICA DE FRENADO (MINERÍA PASIVA)
+        // ==========================================
+        let autoHazardCreated = false;
+        if (prevSpeed !== undefined && lat && lon) {
+            const speedDrop = prevSpeed - currentSpeed;
+            // Si la caída de velocidad es de 20 km/h o más entre pings
+            if (speedDrop >= 20) {
+                console.log(`[INFO] [TxID: ${req.correlationId}] 🚨 AUTO-FRENADO DETECTADO: Caída de ${speedDrop} km/h en ${lat},${lon}. Generando inteligencia...`);
+                
+                const hazardQuery = `
+                    INSERT INTO hazard_candidates (lat, lon, geom, type, source, confidence_score)
+                    VALUES ($1, $2, ST_SetSRID(ST_MakePoint($2, $1), 4326), $3, $4, $5)
+                `;
+                // Fuente: auto_braking | Confianza Base: 15 (un poco menor que reporte humano)
+                await client.query(hazardQuery, [lat, lon, 'brake_hotspot', 'auto_braking', 15]);
+                autoHazardCreated = true;
+            }
+        }
+
         await client.query('COMMIT'); 
-        res.json({ success: true, telemetry: { current_speed_kmh: currentSpeed, new_status: newStatus, continuous_driving_seconds: contDriving, tunnel_recovery_applied: isTunnel } });
+        res.json({ 
+            success: true, 
+            telemetry: { 
+                current_speed_kmh: currentSpeed, 
+                new_status: newStatus, 
+                continuous_driving_seconds: contDriving, 
+                tunnel_recovery_applied: isTunnel,
+                passive_hazard_detected: autoHazardCreated // Avisamos a la app de que cazamos el frenazo
+            } 
+        });
     } catch (error) {
         await client.query('ROLLBACK');
         next(error);
