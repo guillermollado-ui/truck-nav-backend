@@ -7,6 +7,7 @@ const { validateVehicleByCountry } = require('../middleware/validation');
 const routeController = require('../controllers/routeController');
 const sessionController = require('../controllers/sessionController');
 const vehicleController = require('../controllers/vehicleController');
+const hazardController = require('../controllers/hazardController');
 
 // Taquilla
 router.post('/auth/token', generateToken);
@@ -32,5 +33,9 @@ router.get('/sessions/remaining', authenticateJWT, sessionController.getRemainin
 router.post('/sessions/rest/start', authenticateJWT, sessionController.startRest);
 router.post('/sessions/rest/stop', authenticateJWT, sessionController.stopRest);
 router.get('/sessions/hud', authenticateJWT, sessionController.getHud);
+
+// Inteligencia de Carretera (Mente Colmena)
+router.post('/hazards/report', authenticateJWT, hazardController.reportHazard);
+router.get('/hazards/nearby', authenticateJWT, hazardController.getNearbyHazards);
 
 module.exports = router;
