@@ -446,7 +446,6 @@ app.get('/api/legal/verify/:response_id', authenticateJWT, async (req, res, next
 // DÍA 31: BLOQUE 3 - GESTIÓN DE SESIONES DEL CONDUCTOR (TACÓGRAFO)
 // ==========================================
 
-// Iniciar sesión de trabajo
 app.post('/api/sessions/start', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
@@ -481,7 +480,6 @@ app.post('/api/sessions/start', authenticateJWT, async (req, res, next) => {
     }
 });
 
-// Finalizar sesión de trabajo
 app.post('/api/sessions/stop', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
@@ -507,7 +505,6 @@ app.post('/api/sessions/stop', authenticateJWT, async (req, res, next) => {
     }
 });
 
-// Obtener estado actual del tacógrafo
 app.get('/api/sessions/status', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
@@ -543,7 +540,6 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
     const currentSpeed = speed_kmh || 0;
 
     try {
-        // 1. Localizar la jornada activa del conductor
         const sessionResult = await pool.query(
             'SELECT * FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
             [userId]
@@ -557,36 +553,29 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
         const now = new Date();
         const lastChange = new Date(session.last_status_change);
         
-        // 2. ¿Cuántos segundos han pasado desde la última vez que el servidor actualizó el estado?
         const secondsElapsed = Math.floor((now - lastChange) / 1000);
 
         let newStatus = session.current_status;
         let addedSeconds = 0;
         let totalDrivingSeconds = session.accumulated_driving_seconds;
 
-        // 3. Lógica pura del Tacógrafo: ¿Va el camión a más de 10 km/h?
         if (currentSpeed > 10) {
             if (session.current_status === 'DRIVING') {
-                // Sigue en marcha: sumar los segundos transcurridos al acumulador legal
                 addedSeconds = secondsElapsed;
                 totalDrivingSeconds += addedSeconds;
             } else {
-                // El camión acaba de arrancar: Cambiamos estado sin sumar todavía
                 newStatus = 'DRIVING';
             }
         } else {
             if (session.current_status === 'DRIVING') {
-                // El camión acaba de detenerse: sumar el último tramo y poner a descansar
                 addedSeconds = secondsElapsed;
                 totalDrivingSeconds += addedSeconds;
                 newStatus = 'RESTING';
             } else {
-                // Sigue detenido, no hacemos nada con el reloj de conducción
                 newStatus = session.current_status === 'OFF' ? 'OFF' : 'RESTING'; 
             }
         }
 
-        // 4. Si el conductor se movió o cambió de estado, actualizamos la base de datos
         if (addedSeconds > 0 || newStatus !== session.current_status) {
             await pool.query(
                 'UPDATE driver_sessions SET current_status = $1, accumulated_driving_seconds = $2, last_status_change = CURRENT_TIMESTAMP WHERE id = $3',
@@ -604,6 +593,62 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
                 seconds_added_to_driving: addedSeconds,
                 total_driving_seconds: totalDrivingSeconds
             }
+        });
+
+    } catch (error) {
+        next(error);
+    }
+});
+
+// ==========================================
+// DÍA 33: CÁLCULO CONDUCCIÓN RESTANTE DIARIA (REGLAMENTO 561/2006)
+// ==========================================
+app.get('/api/sessions/remaining', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    const DAILY_LIMIT_SECONDS = 9 * 60 * 60; // 9 horas de límite legal diario
+
+    try {
+        console.log(`[INFO] [TxID: ${req.correlationId}] ⏱️ Calculando tiempo restante legal para conductor ${userId}`);
+
+        const result = await pool.query(
+            'SELECT accumulated_driving_seconds FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
+            [userId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.json({ 
+                success: true, 
+                message: 'Sin jornada activa. Límite intacto.', 
+                remaining_seconds: DAILY_LIMIT_SECONDS,
+                formatted_remaining: '09:00',
+                warning_level: 'OK'
+            });
+        }
+
+        const drivingSeconds = result.rows[0].accumulated_driving_seconds;
+        let remainingSeconds = DAILY_LIMIT_SECONDS - drivingSeconds;
+        
+        if (remainingSeconds < 0) remainingSeconds = 0;
+
+        // Convertir la matemática del servidor a algo bonito para el HUD del camionero (ej. 08:45)
+        const hours = Math.floor(remainingSeconds / 3600);
+        const minutes = Math.floor((remainingSeconds % 3600) / 60);
+        const formattedRemaining = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+
+        // Lógica de alertas para la App (Verde, Amarillo, Rojo)
+        let warningLevel = 'OK';
+        if (remainingSeconds <= 1800) { // Queda menos de media hora
+            warningLevel = 'CRITICAL';
+        } else if (remainingSeconds <= 3600) { // Queda menos de 1 hora
+            warningLevel = 'WARNING';
+        }
+
+        res.json({
+            success: true,
+            driving_seconds_accumulated: drivingSeconds,
+            remaining_seconds: remainingSeconds,
+            formatted_remaining: formattedRemaining,
+            warning_level: warningLevel
         });
 
     } catch (error) {
@@ -870,5 +915,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Radar Automático (Día 32) activo en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Cronómetro Legal Europeo (Día 33) activo en puerto ${port}`);
 });
