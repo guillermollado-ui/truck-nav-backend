@@ -93,7 +93,7 @@ app.get('/', (req, res) => {
         status: 'online',
         environment: environment, 
         service: 'Truck Nav API Gateway B2B',
-        message: 'Fundación Sólida (Bloque 1) Operativa al 100%'
+        message: 'Fundación Sólida Operativa al 100%'
     });
 });
 
@@ -600,8 +600,8 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
 // ==========================================
 app.get('/api/sessions/remaining', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
-    const DAILY_LIMIT_SECONDS = 9 * 60 * 60; // 9 horas
-    const CONTINUOUS_LIMIT_SECONDS = 4.5 * 60 * 60; // 4.5 horas
+    const DAILY_LIMIT_SECONDS = 9 * 60 * 60; 
+    const CONTINUOUS_LIMIT_SECONDS = 4.5 * 60 * 60; 
 
     try {
         const result = await pool.query(
@@ -642,7 +642,6 @@ app.get('/api/sessions/remaining', authenticateJWT, async (req, res, next) => {
 // ==========================================
 // DÍA 34: EL CEREBRO DE LAS PAUSAS (15+30 Y FILTRO ANTI-SEMÁFORO)
 // ==========================================
-
 app.get('/api/sessions/check-stop', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
@@ -729,7 +728,7 @@ app.post('/api/sessions/rest/stop', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 35: EL MEGA-ENDPOINT DEL HUD (PANEL DE CONTROL)
+// DÍA 35: EL MEGA-ENDPOINT DEL HUD
 // ==========================================
 app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
@@ -761,7 +760,6 @@ app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
         const lastChange = new Date(session.last_status_change);
         const secondsElapsed = Math.floor((now - lastChange) / 1000);
 
-        // 1. Calcular tiempos reales al milisegundo para la pantalla
         let currentDaily = session.accumulated_driving_seconds || 0;
         let currentCont = session.continuous_driving_seconds || 0;
 
@@ -773,10 +771,8 @@ app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
         let dailyRemaining = Math.max(0, DAILY_LIMIT - currentDaily);
         let contRemaining = Math.max(0, CONTINUOUS_LIMIT - currentCont);
 
-        // 2. Formateador de tiempo bonito para el panel
         const formatTime = (secs) => `${Math.floor(secs / 3600).toString().padStart(2, '0')}:${Math.floor((secs % 3600) / 60).toString().padStart(2, '0')}`;
 
-        // 3. Sistema inteligente de alertas para el HUD
         let warningLevel = 'OK';
         let alerts = [];
 
@@ -797,7 +793,6 @@ app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
             alerts.push(`En descanso. Llevas ${restMinutes} minutos de pausa.`);
         }
 
-        // 4. Devolvemos TODO empaquetado para que la App solo tenga que pintar
         res.json({
             success: true,
             active: true,
@@ -819,9 +814,10 @@ app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 16 - 28: RIESGOS FÍSICOS Y CAJA NEGRA CON HASH INMUTABLE
+// DÍA 16 - 36: RIESGOS FÍSICOS, CAJA NEGRA Y DETECCIÓN DE TIEMPO RESTANTE
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1; // Extraemos al chofer para mirar su tacógrafo
     const { origin, destination, height_m, weight_t, euro_standard, country_code, departure_time } = req.body;
     const truckHeight = height_m || 4.0; 
     const truckWeight = weight_t || 40.0; 
@@ -835,6 +831,21 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
     try {
         console.log(`[INFO] [TxID: ${req.correlationId}] Calculando ruta con matriz 3D. Salida: ${startTime.toISOString()}`);
+        
+        // 1. Miramos el Tacógrafo del chofer ANTES de autorizar la ruta (DÍA 36)
+        let continuousRemainingSeconds = 4.5 * 3600;
+        let dailyRemainingSeconds = 9 * 3600;
+
+        const sessionResult = await pool.query(
+            'SELECT accumulated_driving_seconds, continuous_driving_seconds FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
+            [userId]
+        );
+
+        if (sessionResult.rowCount > 0) {
+            const session = sessionResult.rows[0];
+            continuousRemainingSeconds = Math.max(0, (4.5 * 3600) - (session.continuous_driving_seconds || 0));
+            dailyRemainingSeconds = Math.max(0, (9 * 3600) - (session.accumulated_driving_seconds || 0));
+        }
         
         const routeKey = crypto.createHash('sha256').update(`${origin}_${destination}_${truckHeight}_${truckWeight}_${truckEuro}`).digest('hex');
         let routeData;
@@ -975,6 +986,17 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         }
 
         const finalRouteRisk = totalRouteLength > 0 ? Math.round(totalRiskWeighted / totalRouteLength) : 0;
+        
+        // ==========================================
+        // DÍA 36: LÓGICA DE DETECCIÓN (MAPA + TACÓGRAFO)
+        // ==========================================
+        let exceedsContinuous = accumulatedDurationSeconds > continuousRemainingSeconds;
+        let exceedsDaily = accumulatedDurationSeconds > dailyRemainingSeconds;
+
+        let legalRouteAlert = null;
+        if (exceedsContinuous || exceedsDaily) {
+            legalRouteAlert = `¡ALERTA LEGAL! Esta ruta dura ${Math.floor(accumulatedDurationSeconds / 3600)}h ${Math.floor((accumulatedDurationSeconds % 3600) / 60)}m, pero tu tacógrafo exige pausa antes. Deberás detenerte en el camino.`;
+        }
 
         const updateRouteQuery = `
             UPDATE provider_responses
@@ -991,7 +1013,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         const alertsObj = { 
             urban_zone: routeTouchesUrban, 
             environmental_multa: environmentalAlert, 
-            time_restriction: timeAlert 
+            time_restriction: timeAlert,
+            route_exceeds_continuous_driving_limit: exceedsContinuous, // Día 36 Inyectado
+            route_exceeds_daily_driving_limit: exceedsDaily            // Día 36 Inyectado
         };
         const contextObj = { 
             euro_standard: truckEuro, 
@@ -1047,13 +1071,14 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         
         res.json({
             success: true,
-            message: 'Ruta calculada y sellada criptográficamente (Día 28).',
+            message: 'Ruta calculada y sellada criptográficamente.',
+            legal_warning: legalRouteAlert, // DÍA 36: Mensaje directo para el conductor
             saved_response_id: savedId,
             segments_created: segmentosGuardados,
             final_route_risk: finalRouteRisk,
             alerts: alertsObj,
             applied_context: contextObj,
-            hash: decisionHash, // Se lo devolvemos a la App como acuse de recibo
+            hash: decisionHash, 
             data: routeData
         });
     } catch (error) {
@@ -1077,5 +1102,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Mega-HUD (Día 35) activo en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Intersección Mapa/Tacógrafo (Día 36) activa en puerto ${port}`);
 });
