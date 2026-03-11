@@ -175,15 +175,23 @@ const validateVehicleByCountry = async (req, res, next) => {
 };
 
 // ==========================================
-// DÍA 12, 16 Y 17: MANEJO ROBUSTO Y REINTENTOS EXPONENCIALES PARA HERE API
+// DÍA 12, 16, 17 Y 40.5: MANEJO ROBUSTO Y API OPTIMIZADA
 // ==========================================
-const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, delay = 1000) => {
+// DÍA 40.5 -> Inyección directa de las capacidades del vehículo a HERE
+const fetchRouteFromHEREWithRetry = async (origin, destination, vehicleData = {}, retries = 3, delay = 1000) => {
     const apiKey = process.env.HERE_API_KEY;
     if (!apiKey) {
         throw new Error('HERE_API_KEY no configurada en el servidor.');
     }
 
-    const url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary&apikey=${apiKey}`;
+    let url = `https://router.hereapi.com/v8/routes?transportMode=truck&origin=${origin}&destination=${destination}&return=polyline,summary&apikey=${apiKey}`;
+
+    // DÍA 40.5: Optimizando el endpoint de HERE. Dejamos que ellos hagan el filtro físico pesado.
+    if (vehicleData.height_m) url += `&vehicleHeight=${vehicleData.height_m}`;
+    if (vehicleData.weight_t) url += `&vehicleWeight=${vehicleData.weight_t}`;
+    if (vehicleData.width_m) url += `&vehicleWidth=${vehicleData.width_m}`;
+    if (vehicleData.length_m) url += `&vehicleLength=${vehicleData.length_m}`;
+    if (vehicleData.axleCount) url += `&axleCount=${vehicleData.axleCount}`;
 
     try {
         const response = await axios.get(url, { timeout: 5000 });
@@ -195,7 +203,7 @@ const fetchRouteFromHEREWithRetry = async (origin, destination, retries = 3, del
         if ((isNetworkError || isServerError) && retries > 0) {
             console.warn(`⚠️ [HERE API] Fallo en la llamada. Reintentando en ${delay}ms... (Quedan ${retries} intentos)`);
             await new Promise(resolve => setTimeout(resolve, delay));
-            return fetchRouteFromHEREWithRetry(origin, destination, retries - 1, delay * 2);
+            return fetchRouteFromHEREWithRetry(origin, destination, vehicleData, retries - 1, delay * 2);
         } else {
             console.error(`❌ [HERE API] Error definitivo tras reintentos o error de cliente:`, error.message);
             throw error;
@@ -569,20 +577,26 @@ app.post('/api/sessions/debug/time-jump', authenticateJWT, async (req, res, next
 });
 
 // ==========================================
-// DÍA 40: RADAR DE TELEMETRÍA CON TOLERANCIA A TÚNELES Y ZONAS MUERTAS
+// DÍA 40 Y 40.5: RADAR CON TOLERANCIA A TÚNELES Y BLINDAJE CONTRA CONDICIONES DE CARRERA
 // ==========================================
 app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     const { speed_kmh } = req.body;
     const currentSpeed = speed_kmh || 0;
 
+    // DÍA 40.5: Transacción para bloquear la fila y evitar duplicación de segundos
+    const client = await pool.connect(); 
+
     try {
-        const sessionResult = await pool.query(
-            'SELECT * FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
+        await client.query('BEGIN'); // INICIO DEL BLOQUEO DE FILA
+
+        const sessionResult = await client.query(
+            'SELECT * FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL FOR UPDATE',
             [userId]
         );
 
         if (sessionResult.rowCount === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({ success: false, error: 'No se encontró jornada activa para reportar telemetría.' });
         }
 
@@ -597,18 +611,15 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
         let totalDrivingSeconds = session.accumulated_driving_seconds || 0;
         let continuousDriving = session.continuous_driving_seconds || 0;
         
-        // DÍA 40: LÓGICA DE RECUPERACIÓN DE ZONAS MUERTAS (TÚNELES)
         let isTunnelRecovery = false;
         
-        // Si han pasado más de 120 segundos sin ping, estábamos conduciendo, y reaparecemos conduciendo...
         if (secondsElapsed > 120 && session.current_status === 'DRIVING' && currentSpeed > 10) {
-            console.warn(`[INFO] [TxID: ${req.correlationId}] 🚇 Zona muerta superada. El camión cruzó un túnel o perdió cobertura. Recuperando ${Math.floor(secondsElapsed / 60)} mins de conducción en la sombra.`);
+            console.warn(`[INFO] [TxID: ${req.correlationId}] 🚇 Zona muerta superada. Recuperando ${Math.floor(secondsElapsed / 60)} mins de conducción en la sombra.`);
             isTunnelRecovery = true;
         }
 
         if (currentSpeed > 10) {
             if (session.current_status === 'DRIVING') {
-                // Sumamos todo el tiempo, incluso si fueron 15 minutos de túnel.
                 addedSeconds = secondsElapsed;
                 totalDrivingSeconds += addedSeconds;
                 continuousDriving += addedSeconds;
@@ -627,11 +638,13 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
         }
 
         if (addedSeconds > 0 || newStatus !== session.current_status) {
-            await pool.query(
+            await client.query(
                 'UPDATE driver_sessions SET current_status = $1, accumulated_driving_seconds = $2, continuous_driving_seconds = $3, last_status_change = CURRENT_TIMESTAMP WHERE id = $4',
                 [newStatus, totalDrivingSeconds, continuousDriving, session.id]
             );
         }
+
+        await client.query('COMMIT'); // DÍA 40.5: FIN DEL BLOQUEO, LIBERAMOS LA FILA
 
         res.json({
             success: true,
@@ -640,12 +653,15 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
                 new_status: newStatus,
                 total_driving_seconds: totalDrivingSeconds,
                 continuous_driving_seconds: continuousDriving,
-                tunnel_recovery_applied: isTunnelRecovery // DÍA 40: Avisamos a la App de que salvamos los datos
+                tunnel_recovery_applied: isTunnelRecovery
             }
         });
 
     } catch (error) {
+        await client.query('ROLLBACK');
         next(error);
+    } finally {
+        client.release(); // DÍA 40.5: Siempre devolvemos el cliente al Pool
     }
 });
 
@@ -868,14 +884,22 @@ app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 16 - 38: RIESGOS FÍSICOS, CAJA NEGRA Y PENALIZADOR DE RUTAS
+// DÍA 16 - 40.5: RIESGOS FÍSICOS, CAJA NEGRA Y PENALIZADOR DE RUTAS (AHORA PASA DATOS A HERE)
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1; 
-    const { origin, destination, height_m, weight_t, euro_standard, country_code, departure_time, force_no_parking } = req.body;
-    const truckHeight = height_m || 4.0; 
-    const truckWeight = weight_t || 40.0; 
-    const truckEuro = euro_standard || 6; 
+    const { origin, destination, height_m, weight_t, length_m, width_m, axles, euro_standard, country_code, departure_time, force_no_parking } = req.body;
+    
+    // Preparando los datos para la inyección directa a HERE (Día 40.5)
+    const vehicleData = {
+        height_m: height_m || 4.0, 
+        weight_t: weight_t || 40.0,
+        length_m: length_m,
+        width_m: width_m,
+        axleCount: axles,
+        euro_standard: euro_standard || 6
+    };
+    
     const targetCountry = country_code || 'DEU'; 
     const startTime = departure_time ? new Date(departure_time) : new Date();
 
@@ -902,17 +926,18 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         
         let timeLimitToUse = Math.min(continuousRemainingSeconds, dailyRemainingSeconds);
         
-        const routeKey = crypto.createHash('sha256').update(`${origin}_${destination}_${truckHeight}_${truckWeight}_${truckEuro}`).digest('hex');
+        const routeKey = crypto.createHash('sha256').update(`${origin}_${destination}_${vehicleData.height_m}_${vehicleData.weight_t}_${vehicleData.euro_standard}`).digest('hex');
         let routeData;
         
         const cacheResult = await pool.query('SELECT raw_response FROM route_cache WHERE route_key = $1', [routeKey]);
         
         if (cacheResult.rowCount > 0) {
-            console.log(`[INFO] [TxID: ${req.correlationId}] ⚡ Ruta recuperada de la caché (Costo HERE API evitado)`);
+            console.log(`[INFO] [TxID: ${req.correlationId}] ⚡ Ruta recuperada de la caché`);
             routeData = cacheResult.rows[0].raw_response;
         } else {
-            console.log(`[INFO] [TxID: ${req.correlationId}] 📡 Consultando HERE API (Nueva ruta)...`);
-            routeData = await fetchRouteFromHEREWithRetry(origin, destination);
+            console.log(`[INFO] [TxID: ${req.correlationId}] 📡 Consultando HERE API (Día 40.5 - Optimizada)...`);
+            // Ahora le pasamos el objeto vehicleData a la función para que monte los query params
+            routeData = await fetchRouteFromHEREWithRetry(origin, destination, vehicleData);
             
             await pool.query(
                 'INSERT INTO route_cache (route_key, raw_response) VALUES ($1, $2) ON CONFLICT (route_key) DO NOTHING', 
@@ -978,9 +1003,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
                 let segmentHeightLimit = 5.0; 
                 if (section.notices && section.notices.some(n => n.title.includes('height'))) {
-                    segmentHeightLimit = truckHeight + 0.10; 
+                    segmentHeightLimit = vehicleData.height_m + 0.10; 
                 }
-                const heightMargin = segmentHeightLimit - truckHeight;
+                const heightMargin = segmentHeightLimit - vehicleData.height_m;
                 let heightRiskScore = 0;
                 if (heightMargin >= 0.50) heightRiskScore = 0;
                 else if (heightMargin <= 0.05) heightRiskScore = 100;
@@ -988,9 +1013,9 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
                 let segmentWeightLimit = 44.0;
                 if (section.notices && section.notices.some(n => n.title.includes('weight'))) {
-                    segmentWeightLimit = truckWeight + 0.5;
+                    segmentWeightLimit = vehicleData.weight_t + 0.5;
                 }
-                const weightMargin = segmentWeightLimit - truckWeight;
+                const weightMargin = segmentWeightLimit - vehicleData.weight_t;
                 let weightRiskScore = 0;
                 if (weightMargin >= 5.0) weightRiskScore = 0;
                 else if (weightMargin <= 0.5) weightRiskScore = 100;
@@ -998,10 +1023,10 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
 
                 let environmentalRiskScore = 0;
                 if (isUrbanDense && requiredEuro > 0) {
-                    if (truckEuro < requiredEuro) {
+                    if (vehicleData.euro_standard < requiredEuro) {
                         environmentalRiskScore = 100; 
                         environmentalAlert = true;
-                    } else if (truckEuro === requiredEuro) {
+                    } else if (vehicleData.euro_standard === requiredEuro) {
                         environmentalRiskScore = 30;  
                     }
                 }
@@ -1078,7 +1103,7 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
         `;
         await pool.query(updateRouteQuery, [finalRouteRisk, savedId]);
 
-        console.log(`[INFO] [TxID: ${req.correlationId}] 🔐 Generando Hash Criptográfico Inmutable (Día 28)...`);
+        console.log(`[INFO] [TxID: ${req.correlationId}] 🔐 Generando Hash Criptográfico Inmutable...`);
         
         const alertsObj = { 
             urban_zone: routeTouchesUrban, 
@@ -1090,14 +1115,14 @@ app.post('/api/route', authenticateJWT, async (req, res, next) => {
             no_safe_parking_found: !isRouteViable 
         };
         const contextObj = { 
-            euro_standard: truckEuro, 
+            euro_standard: vehicleData.euro_standard, 
             departure_time: startTime.toISOString() 
         };
 
         const vehicleSnapshotObj = {
-            height_m: truckHeight,
-            weight_t: truckWeight,
-            euro_standard: truckEuro
+            height_m: vehicleData.height_m,
+            weight_t: vehicleData.weight_t,
+            euro_standard: vehicleData.euro_standard
         };
 
         const rulesSnapshotObj = {
@@ -1172,5 +1197,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Obra Maestra Final con Tolerancia a Túneles (Día 40) activa en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - El Pulido de Oro (Día 40.5) activo en puerto ${port}`);
 });
