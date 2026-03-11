@@ -103,7 +103,7 @@ app.post('/api/auth/token', (req, res) => {
     // OPERACIÓN ESCUDO: Validación estricta sin fallbacks
     if (api_key === API_KEY) {
         const token = jwt.sign(
-            { role: 'truck_client', access: 'fleet_data' },
+            { role: 'truck_client', access: 'fleet_data', user_id: 1 }, // Añadido user_id: 1 para el Tacógrafo
             JWT_SECRET,
             { expiresIn: '2h' } 
         );
@@ -443,6 +443,98 @@ app.get('/api/legal/verify/:response_id', authenticateJWT, async (req, res, next
 });
 
 // ==========================================
+// DÍA 31: BLOQUE 3 - GESTIÓN DE SESIONES DEL CONDUCTOR (TACÓGRAFO)
+// ==========================================
+
+// Iniciar sesión de trabajo
+app.post('/api/sessions/start', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    try {
+        const checkActive = await pool.query(
+            'SELECT id FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
+            [userId]
+        );
+
+        if (checkActive.rowCount > 0) {
+            return res.json({ 
+                success: true, 
+                message: 'Ya existe una sesión activa. Recuperando datos...', 
+                session_id: checkActive.rows[0].id 
+            });
+        }
+
+        const result = await pool.query(
+            'INSERT INTO driver_sessions (user_id, current_status) VALUES ($1, $2) RETURNING id, start_time',
+            [userId, 'OFF']
+        );
+
+        console.log(`[INFO] [TxID: ${req.correlationId}] 🚛 Sesión iniciada para conductor ${userId}`);
+        
+        res.status(201).json({
+            success: true,
+            message: 'Jornada iniciada con éxito.',
+            session_id: result.rows[0].id,
+            start_time: result.rows[0].start_time
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// Finalizar sesión de trabajo
+app.post('/api/sessions/stop', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    try {
+        const result = await pool.query(
+            'UPDATE driver_sessions SET end_time = CURRENT_TIMESTAMP, current_status = $1 WHERE user_id = $2 AND end_time IS NULL RETURNING id, end_time',
+            ['OFF', userId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ success: false, error: 'No hay ninguna sesión activa para cerrar.' });
+        }
+
+        console.log(`[INFO] [TxID: ${req.correlationId}] 🏁 Sesión finalizada para conductor ${userId}`);
+
+        res.json({
+            success: true,
+            message: 'Jornada cerrada correctamente.',
+            session_id: result.rows[0].id,
+            end_time: result.rows[0].end_time
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// Obtener estado actual del tacógrafo
+app.get('/api/sessions/status', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    try {
+        const result = await pool.query(
+            'SELECT * FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
+            [userId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.json({ success: true, active: false, status: 'OFF', message: 'Sin jornada activa.' });
+        }
+
+        const session = result.rows[0];
+        res.json({
+            success: true,
+            active: true,
+            session_id: session.id,
+            status: session.current_status,
+            driving_time_seconds: session.accumulated_driving_seconds,
+            last_change: session.last_status_change
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// ==========================================
 // DÍA 16 - 28: RIESGOS FÍSICOS Y CAJA NEGRA CON HASH INMUTABLE
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
@@ -701,5 +793,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Caja Negra 100% Auditada y Determinista (Día 30) activa en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Caja Negra y Tacógrafo (Día 31) activos en puerto ${port}`);
 });
