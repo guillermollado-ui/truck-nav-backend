@@ -409,19 +409,13 @@ app.get('/api/legal/verify/:response_id', authenticateJWT, async (req, res, next
 
         const auditData = auditResult.rows[0];
 
-        // 1. Usamos el JSON determinista para asegurar que las letras están en el mismo orden que cuando se firmó
         const strAlerts = sortJSON(auditData.alerts_triggered);
         const strContext = sortJSON(auditData.applied_context);
         const strVehicle = sortJSON(auditData.vehicle_snapshot);
         const strRules = sortJSON(auditData.rules_snapshot);
 
-        // 2. Reconstruimos la cadena de texto
         const payloadToHash = `${auditData.response_id}_${auditData.origin_coords}_${auditData.destination_coords}_${auditData.final_risk_score}_${strAlerts}_${strContext}_${strVehicle}_${strRules}`;
-        
-        // 3. Volvemos a batir la firma
         const currentHash = crypto.createHash('sha256').update(payloadToHash).digest('hex');
-
-        // 4. ¿Coincide?
         const isIntact = currentHash === auditData.decision_hash;
 
         res.json({
@@ -566,10 +560,9 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
                 totalDrivingSeconds += addedSeconds;
                 continuousDriving += addedSeconds;
             } else {
-                newStatus = 'DRIVING'; // Arrancó
+                newStatus = 'DRIVING'; 
             }
         } else {
-            // DÍA 34: Si frena, NUNCA asumimos descanso. Asumimos "Otros Trabajos" (Martillos)
             if (session.current_status === 'DRIVING') {
                 addedSeconds = secondsElapsed;
                 totalDrivingSeconds += addedSeconds;
@@ -630,7 +623,7 @@ app.get('/api/sessions/remaining', authenticateJWT, async (req, res, next) => {
         const formatTime = (secs) => `${Math.floor(secs / 3600).toString().padStart(2, '0')}:${Math.floor((secs % 3600) / 60).toString().padStart(2, '0')}`;
 
         let warningLevel = 'OK';
-        if (contRemaining <= 1800) warningLevel = 'CRITICAL'; // Queda menos de 30 mins para parar sí o sí
+        if (contRemaining <= 1800) warningLevel = 'CRITICAL'; 
         else if (contRemaining <= 3600) warningLevel = 'WARNING';
 
         res.json({
@@ -650,7 +643,6 @@ app.get('/api/sessions/remaining', authenticateJWT, async (req, res, next) => {
 // DÍA 34: EL CEREBRO DE LAS PAUSAS (15+30 Y FILTRO ANTI-SEMÁFORO)
 // ==========================================
 
-// 1. Antena silenciosa: ¿Llevamos parados más de 3 minutos en Martillos?
 app.get('/api/sessions/check-stop', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
@@ -666,7 +658,6 @@ app.get('/api/sessions/check-stop', authenticateJWT, async (req, res, next) => {
             const lastChange = new Date(session.last_status_change);
             const secondsStopped = Math.floor((now - lastChange) / 1000);
 
-            // Si lleva más de 3 minutos (180 segundos) detenido en Martillos, salta la alarma
             if (secondsStopped > 180) {
                 return res.json({
                     prompt_rest_warning: true,
@@ -678,7 +669,6 @@ app.get('/api/sessions/check-stop', authenticateJWT, async (req, res, next) => {
     } catch (error) { next(error); }
 });
 
-// 2. El conductor confirma que puso la cama en el camión
 app.post('/api/sessions/rest/start', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
@@ -690,7 +680,6 @@ app.post('/api/sessions/rest/start', authenticateJWT, async (req, res, next) => 
     } catch (error) { next(error); }
 });
 
-// 3. El conductor arranca o quita la cama: Evaluamos si el descanso vale (45m o 15+30m)
 app.post('/api/sessions/rest/stop', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
@@ -704,28 +693,24 @@ app.post('/api/sessions/rest/stop', authenticateJWT, async (req, res, next) => {
 
         const now = new Date();
         const restStart = new Date(session.last_status_change);
-        const restMinutes = Math.floor((now - restStart) / 60000); // Pasamos a minutos
+        const restMinutes = Math.floor((now - restStart) / 60000); 
 
         let breaks = session.split_breaks || [];
         let continuousDriving = session.continuous_driving_seconds;
         let auditMessage = '';
 
         if (restMinutes >= 45) {
-            // Descanso de 45 del tirón: Legal
             continuousDriving = 0;
             breaks = [];
             auditMessage = `Descanso completo de ${restMinutes}m validado. Reloj de conducción continua reseteado a 4.5h.`;
         } else if (restMinutes >= 30 && breaks.includes(15)) {
-            // Descanso fraccionado válido (hizo 15 antes y ahora 30)
             continuousDriving = 0;
             breaks = [];
             auditMessage = `Segundo bloque de 30m validado (Fraccionado 15+30 completado). Reloj reseteado a 4.5h.`;
         } else if (restMinutes >= 15 && restMinutes < 45 && breaks.length === 0) {
-            // Primer bloque fraccionado válido
             breaks.push(15);
             auditMessage = `Primer bloque de descanso (mínimo 15m) registrado. El reloj de 4.5h NO se resetea hasta que hagas el segundo bloque de 30m.`;
         } else {
-            // Descanso inútil (ej. 10 minutos o 20 minutos de segundo bloque)
             auditMessage = `Pausa de ${restMinutes}m insuficiente para la ley. No cuenta para el descanso de 45m ni fraccionado.`;
         }
 
@@ -741,6 +726,96 @@ app.post('/api/sessions/rest/stop', authenticateJWT, async (req, res, next) => {
         });
 
     } catch (error) { next(error); }
+});
+
+// ==========================================
+// DÍA 35: EL MEGA-ENDPOINT DEL HUD (PANEL DE CONTROL)
+// ==========================================
+app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    const DAILY_LIMIT = 9 * 3600;
+    const CONTINUOUS_LIMIT = 4.5 * 3600;
+
+    try {
+        const result = await pool.query(
+            'SELECT * FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
+            [userId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.json({
+                success: true,
+                active: false,
+                hud_data: {
+                    status: 'OFF',
+                    daily_remaining: '09:00',
+                    continuous_remaining: '04:30',
+                    warning_level: 'OK',
+                    alerts: []
+                }
+            });
+        }
+
+        const session = result.rows[0];
+        const now = new Date();
+        const lastChange = new Date(session.last_status_change);
+        const secondsElapsed = Math.floor((now - lastChange) / 1000);
+
+        // 1. Calcular tiempos reales al milisegundo para la pantalla
+        let currentDaily = session.accumulated_driving_seconds || 0;
+        let currentCont = session.continuous_driving_seconds || 0;
+
+        if (session.current_status === 'DRIVING') {
+            currentDaily += secondsElapsed;
+            currentCont += secondsElapsed;
+        }
+
+        let dailyRemaining = Math.max(0, DAILY_LIMIT - currentDaily);
+        let contRemaining = Math.max(0, CONTINUOUS_LIMIT - currentCont);
+
+        // 2. Formateador de tiempo bonito para el panel
+        const formatTime = (secs) => `${Math.floor(secs / 3600).toString().padStart(2, '0')}:${Math.floor((secs % 3600) / 60).toString().padStart(2, '0')}`;
+
+        // 3. Sistema inteligente de alertas para el HUD
+        let warningLevel = 'OK';
+        let alerts = [];
+
+        if (contRemaining <= 1800) {
+            warningLevel = 'CRITICAL';
+            alerts.push('¡PELIGRO! Parada de 45 min obligatoria inminente.');
+        } else if (contRemaining <= 3600) {
+            warningLevel = 'WARNING';
+            alerts.push('Aviso: Busca parking. Descanso requerido en menos de 1 hora.');
+        }
+
+        if (session.current_status === 'OTHER_WORK' && secondsElapsed > 180) {
+            alerts.push('¿Detenido? Recuerda poner la CAMA si vas a hacer pausa legal.');
+        }
+
+        if (session.current_status === 'RESTING') {
+            const restMinutes = Math.floor(secondsElapsed / 60);
+            alerts.push(`En descanso. Llevas ${restMinutes} minutos de pausa.`);
+        }
+
+        // 4. Devolvemos TODO empaquetado para que la App solo tenga que pintar
+        res.json({
+            success: true,
+            active: true,
+            hud_data: {
+                status: session.current_status,
+                daily_driving_accumulated: formatTime(currentDaily),
+                daily_remaining: formatTime(dailyRemaining),
+                continuous_driving_accumulated: formatTime(currentCont),
+                continuous_remaining: formatTime(contRemaining),
+                split_breaks_done: session.split_breaks || [],
+                warning_level: warningLevel,
+                alerts: alerts,
+                last_update: now.toISOString()
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
 });
 
 // ==========================================
@@ -1002,5 +1077,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - El Cerebro de Pausas 15+30 (Día 34) activo en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Mega-HUD (Día 35) activo en puerto ${port}`);
 });
