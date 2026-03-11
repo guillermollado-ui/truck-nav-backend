@@ -100,7 +100,6 @@ app.get('/', (req, res) => {
 // 3. LA TAQUILLA (Generación JWT)
 app.post('/api/auth/token', (req, res) => {
     const { api_key } = req.body;
-    // OPERACIÓN ESCUDO: Validación estricta sin fallbacks
     if (api_key === API_KEY) {
         const token = jwt.sign(
             { role: 'truck_client', access: 'fleet_data', user_id: 1 }, 
@@ -445,7 +444,6 @@ app.get('/api/legal/verify/:response_id', authenticateJWT, async (req, res, next
 // ==========================================
 // DÍA 31: BLOQUE 3 - GESTIÓN DE SESIONES DEL CONDUCTOR (TACÓGRAFO)
 // ==========================================
-
 app.post('/api/sessions/start', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
@@ -524,7 +522,9 @@ app.get('/api/sessions/status', authenticateJWT, async (req, res, next) => {
             session_id: session.id,
             status: session.current_status,
             driving_time_seconds: session.accumulated_driving_seconds,
-            last_change: session.last_status_change
+            continuous_driving_seconds: session.continuous_driving_seconds,
+            last_change: session.last_status_change,
+            split_breaks: session.split_breaks
         });
     } catch (error) {
         next(error);
@@ -532,7 +532,7 @@ app.get('/api/sessions/status', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 32: RADAR AUTOMÁTICO DE CONDUCCIÓN (> X KM/H)
+// DÍA 32 MODIFICADO: RADAR CON DETECCIÓN DE MARTILLOS (OTHER_WORK)
 // ==========================================
 app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
@@ -557,41 +557,43 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
 
         let newStatus = session.current_status;
         let addedSeconds = 0;
-        let totalDrivingSeconds = session.accumulated_driving_seconds;
+        let totalDrivingSeconds = session.accumulated_driving_seconds || 0;
+        let continuousDriving = session.continuous_driving_seconds || 0;
 
         if (currentSpeed > 10) {
             if (session.current_status === 'DRIVING') {
                 addedSeconds = secondsElapsed;
                 totalDrivingSeconds += addedSeconds;
+                continuousDriving += addedSeconds;
             } else {
-                newStatus = 'DRIVING';
+                newStatus = 'DRIVING'; // Arrancó
             }
         } else {
+            // DÍA 34: Si frena, NUNCA asumimos descanso. Asumimos "Otros Trabajos" (Martillos)
             if (session.current_status === 'DRIVING') {
                 addedSeconds = secondsElapsed;
                 totalDrivingSeconds += addedSeconds;
-                newStatus = 'RESTING';
-            } else {
-                newStatus = session.current_status === 'OFF' ? 'OFF' : 'RESTING'; 
+                continuousDriving += addedSeconds;
+                newStatus = 'OTHER_WORK';
+            } else if (session.current_status !== 'RESTING' && session.current_status !== 'OFF') {
+                newStatus = 'OTHER_WORK';
             }
         }
 
         if (addedSeconds > 0 || newStatus !== session.current_status) {
             await pool.query(
-                'UPDATE driver_sessions SET current_status = $1, accumulated_driving_seconds = $2, last_status_change = CURRENT_TIMESTAMP WHERE id = $3',
-                [newStatus, totalDrivingSeconds, session.id]
+                'UPDATE driver_sessions SET current_status = $1, accumulated_driving_seconds = $2, continuous_driving_seconds = $3, last_status_change = CURRENT_TIMESTAMP WHERE id = $4',
+                [newStatus, totalDrivingSeconds, continuousDriving, session.id]
             );
         }
 
         res.json({
             success: true,
-            message: 'Telemetría registrada y analizada.',
             telemetry: {
                 current_speed_kmh: currentSpeed,
-                previous_status: session.current_status,
                 new_status: newStatus,
-                seconds_added_to_driving: addedSeconds,
-                total_driving_seconds: totalDrivingSeconds
+                total_driving_seconds: totalDrivingSeconds,
+                continuous_driving_seconds: continuousDriving
             }
         });
 
@@ -601,59 +603,144 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 33: CÁLCULO CONDUCCIÓN RESTANTE DIARIA (REGLAMENTO 561/2006)
+// DÍA 33: CÁLCULO CONDUCCIÓN RESTANTE DIARIA Y CONTINUA (4.5h)
 // ==========================================
 app.get('/api/sessions/remaining', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
-    const DAILY_LIMIT_SECONDS = 9 * 60 * 60; // 9 horas de límite legal diario
+    const DAILY_LIMIT_SECONDS = 9 * 60 * 60; // 9 horas
+    const CONTINUOUS_LIMIT_SECONDS = 4.5 * 60 * 60; // 4.5 horas
 
     try {
-        console.log(`[INFO] [TxID: ${req.correlationId}] ⏱️ Calculando tiempo restante legal para conductor ${userId}`);
-
         const result = await pool.query(
-            'SELECT accumulated_driving_seconds FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
+            'SELECT accumulated_driving_seconds, continuous_driving_seconds FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
             [userId]
         );
 
         if (result.rowCount === 0) {
-            return res.json({ 
-                success: true, 
-                message: 'Sin jornada activa. Límite intacto.', 
-                remaining_seconds: DAILY_LIMIT_SECONDS,
-                formatted_remaining: '09:00',
-                warning_level: 'OK'
-            });
+            return res.json({ success: false, error: 'Sin jornada activa.' });
         }
 
-        const drivingSeconds = result.rows[0].accumulated_driving_seconds;
-        let remainingSeconds = DAILY_LIMIT_SECONDS - drivingSeconds;
+        const session = result.rows[0];
+        let dailyRemaining = DAILY_LIMIT_SECONDS - (session.accumulated_driving_seconds || 0);
+        let contRemaining = CONTINUOUS_LIMIT_SECONDS - (session.continuous_driving_seconds || 0);
         
-        if (remainingSeconds < 0) remainingSeconds = 0;
+        if (dailyRemaining < 0) dailyRemaining = 0;
+        if (contRemaining < 0) contRemaining = 0;
 
-        // Convertir la matemática del servidor a algo bonito para el HUD del camionero (ej. 08:45)
-        const hours = Math.floor(remainingSeconds / 3600);
-        const minutes = Math.floor((remainingSeconds % 3600) / 60);
-        const formattedRemaining = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+        const formatTime = (secs) => `${Math.floor(secs / 3600).toString().padStart(2, '0')}:${Math.floor((secs % 3600) / 60).toString().padStart(2, '0')}`;
 
-        // Lógica de alertas para la App (Verde, Amarillo, Rojo)
         let warningLevel = 'OK';
-        if (remainingSeconds <= 1800) { // Queda menos de media hora
-            warningLevel = 'CRITICAL';
-        } else if (remainingSeconds <= 3600) { // Queda menos de 1 hora
-            warningLevel = 'WARNING';
-        }
+        if (contRemaining <= 1800) warningLevel = 'CRITICAL'; // Queda menos de 30 mins para parar sí o sí
+        else if (contRemaining <= 3600) warningLevel = 'WARNING';
 
         res.json({
             success: true,
-            driving_seconds_accumulated: drivingSeconds,
-            remaining_seconds: remainingSeconds,
-            formatted_remaining: formattedRemaining,
+            daily_remaining_formatted: formatTime(dailyRemaining),
+            continuous_remaining_formatted: formatTime(contRemaining),
+            must_rest_in: formatTime(contRemaining),
             warning_level: warningLevel
         });
 
     } catch (error) {
         next(error);
     }
+});
+
+// ==========================================
+// DÍA 34: EL CEREBRO DE LAS PAUSAS (15+30 Y FILTRO ANTI-SEMÁFORO)
+// ==========================================
+
+// 1. Antena silenciosa: ¿Llevamos parados más de 3 minutos en Martillos?
+app.get('/api/sessions/check-stop', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    try {
+        const result = await pool.query(
+            'SELECT current_status, last_status_change FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL',
+            [userId]
+        );
+        if (result.rowCount === 0) return res.json({ prompt_rest_warning: false });
+
+        const session = result.rows[0];
+        if (session.current_status === 'OTHER_WORK') {
+            const now = new Date();
+            const lastChange = new Date(session.last_status_change);
+            const secondsStopped = Math.floor((now - lastChange) / 1000);
+
+            // Si lleva más de 3 minutos (180 segundos) detenido en Martillos, salta la alarma
+            if (secondsStopped > 180) {
+                return res.json({
+                    prompt_rest_warning: true,
+                    message: `[ATENCIÓN] Llevas ${Math.floor(secondsStopped / 60)} mins detenido. Si vas a hacer pausa, pon el tacógrafo del camión en CAMA y confírmalo en la App para no perder minutos.`
+                });
+            }
+        }
+        res.json({ prompt_rest_warning: false });
+    } catch (error) { next(error); }
+});
+
+// 2. El conductor confirma que puso la cama en el camión
+app.post('/api/sessions/rest/start', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    try {
+        await pool.query(
+            'UPDATE driver_sessions SET current_status = $1, last_status_change = CURRENT_TIMESTAMP WHERE user_id = $2 AND end_time IS NULL',
+            ['RESTING', userId]
+        );
+        res.json({ success: true, message: 'Modo CAMA activado. Cronómetro de pausa legal iniciado.' });
+    } catch (error) { next(error); }
+});
+
+// 3. El conductor arranca o quita la cama: Evaluamos si el descanso vale (45m o 15+30m)
+app.post('/api/sessions/rest/stop', authenticateJWT, async (req, res, next) => {
+    const userId = req.user.user_id || 1;
+    try {
+        const result = await pool.query('SELECT * FROM driver_sessions WHERE user_id = $1 AND end_time IS NULL', [userId]);
+        if (result.rowCount === 0) return res.status(404).json({ success: false, error: 'Sin jornada activa.' });
+
+        const session = result.rows[0];
+        if (session.current_status !== 'RESTING') {
+            return res.status(400).json({ success: false, error: 'El tacógrafo no estaba en modo CAMA.' });
+        }
+
+        const now = new Date();
+        const restStart = new Date(session.last_status_change);
+        const restMinutes = Math.floor((now - restStart) / 60000); // Pasamos a minutos
+
+        let breaks = session.split_breaks || [];
+        let continuousDriving = session.continuous_driving_seconds;
+        let auditMessage = '';
+
+        if (restMinutes >= 45) {
+            // Descanso de 45 del tirón: Legal
+            continuousDriving = 0;
+            breaks = [];
+            auditMessage = `Descanso completo de ${restMinutes}m validado. Reloj de conducción continua reseteado a 4.5h.`;
+        } else if (restMinutes >= 30 && breaks.includes(15)) {
+            // Descanso fraccionado válido (hizo 15 antes y ahora 30)
+            continuousDriving = 0;
+            breaks = [];
+            auditMessage = `Segundo bloque de 30m validado (Fraccionado 15+30 completado). Reloj reseteado a 4.5h.`;
+        } else if (restMinutes >= 15 && restMinutes < 45 && breaks.length === 0) {
+            // Primer bloque fraccionado válido
+            breaks.push(15);
+            auditMessage = `Primer bloque de descanso (mínimo 15m) registrado. El reloj de 4.5h NO se resetea hasta que hagas el segundo bloque de 30m.`;
+        } else {
+            // Descanso inútil (ej. 10 minutos o 20 minutos de segundo bloque)
+            auditMessage = `Pausa de ${restMinutes}m insuficiente para la ley. No cuenta para el descanso de 45m ni fraccionado.`;
+        }
+
+        await pool.query(
+            'UPDATE driver_sessions SET current_status = $1, continuous_driving_seconds = $2, split_breaks = $3, last_status_change = CURRENT_TIMESTAMP WHERE id = $4',
+            ['OTHER_WORK', continuousDriving, JSON.stringify(breaks), session.id]
+        );
+
+        res.json({
+            success: true,
+            rest_minutes_detected: restMinutes,
+            legal_status: auditMessage
+        });
+
+    } catch (error) { next(error); }
 });
 
 // ==========================================
@@ -915,5 +1002,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Cronómetro Legal Europeo (Día 33) activo en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - El Cerebro de Pausas 15+30 (Día 34) activo en puerto ${port}`);
 });
