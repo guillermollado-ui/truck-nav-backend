@@ -484,10 +484,10 @@ app.get('/api/legal/verify/:response_id', authenticateJWT, async (req, res, next
 app.post('/api/sessions/start', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
     try {
-        // En una simulación, si el usuario hace Start, matamos la sesión anterior para empezar limpios
         await pool.query('UPDATE driver_sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = $1 AND end_time IS NULL', [userId]);
         const result = await pool.query('INSERT INTO driver_sessions (user_id, current_status) VALUES ($1, $2) RETURNING id, start_time', [userId, 'OFF']);
-        res.status(201).json({ success: true, session_id: result.rows[0].id });
+        console.log(`[INFO] [TxID: ${req.correlationId}] 🚛 Sesión iniciada para conductor ${userId}`);
+        res.status(201).json({ success: true, message: 'Jornada iniciada con éxito.', session_id: result.rows[0].id });
     } catch (error) { next(error); }
 });
 
@@ -569,7 +569,7 @@ app.post('/api/sessions/debug/time-jump', authenticateJWT, async (req, res, next
 });
 
 // ==========================================
-// DÍA 32 MODIFICADO: RADAR CON DETECCIÓN DE MARTILLOS (OTHER_WORK)
+// DÍA 40: RADAR DE TELEMETRÍA CON TOLERANCIA A TÚNELES Y ZONAS MUERTAS
 // ==========================================
 app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1;
@@ -596,9 +596,19 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
         let addedSeconds = 0;
         let totalDrivingSeconds = session.accumulated_driving_seconds || 0;
         let continuousDriving = session.continuous_driving_seconds || 0;
+        
+        // DÍA 40: LÓGICA DE RECUPERACIÓN DE ZONAS MUERTAS (TÚNELES)
+        let isTunnelRecovery = false;
+        
+        // Si han pasado más de 120 segundos sin ping, estábamos conduciendo, y reaparecemos conduciendo...
+        if (secondsElapsed > 120 && session.current_status === 'DRIVING' && currentSpeed > 10) {
+            console.warn(`[INFO] [TxID: ${req.correlationId}] 🚇 Zona muerta superada. El camión cruzó un túnel o perdió cobertura. Recuperando ${Math.floor(secondsElapsed / 60)} mins de conducción en la sombra.`);
+            isTunnelRecovery = true;
+        }
 
         if (currentSpeed > 10) {
             if (session.current_status === 'DRIVING') {
+                // Sumamos todo el tiempo, incluso si fueron 15 minutos de túnel.
                 addedSeconds = secondsElapsed;
                 totalDrivingSeconds += addedSeconds;
                 continuousDriving += addedSeconds;
@@ -629,7 +639,8 @@ app.post('/api/sessions/telemetry', authenticateJWT, async (req, res, next) => {
                 current_speed_kmh: currentSpeed,
                 new_status: newStatus,
                 total_driving_seconds: totalDrivingSeconds,
-                continuous_driving_seconds: continuousDriving
+                continuous_driving_seconds: continuousDriving,
+                tunnel_recovery_applied: isTunnelRecovery // DÍA 40: Avisamos a la App de que salvamos los datos
             }
         });
 
@@ -857,7 +868,7 @@ app.get('/api/sessions/hud', authenticateJWT, async (req, res, next) => {
 });
 
 // ==========================================
-// DÍA 16 - 38: RIESGOS FÍSICOS, CAJA NEGRA, TIEMPO RESTANTE Y PENALIZADOR DE RUTAS (DÍA 38)
+// DÍA 16 - 38: RIESGOS FÍSICOS, CAJA NEGRA Y PENALIZADOR DE RUTAS
 // ==========================================
 app.post('/api/route', authenticateJWT, async (req, res, next) => {
     const userId = req.user.user_id || 1; 
@@ -1161,5 +1172,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-    console.log(`🚀 API Gateway B2B - Motor B2B Completo + Condensador de Fluzo activo en puerto ${port}`);
+    console.log(`🚀 API Gateway B2B - Obra Maestra Final con Tolerancia a Túneles (Día 40) activa en puerto ${port}`);
 });
