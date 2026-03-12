@@ -1,36 +1,42 @@
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 
-// 🔥 CONFIGURACIÓN BLINDADA PARA EVITAR EL TIMEOUT EN RENDER 🔥
+// 💡 DIAGNÓSTICO DE INICIO
+if (!process.env.DATABASE_URL) {
+    console.error("❌ [ERROR CRÍTICO] DATABASE_URL no está definida en Render.");
+} else {
+    console.log("📡 [INFO] Intentando conectar a la base de datos...");
+}
+
+// 🔥 CONFIGURACIÓN BLINDADA PARA RENDER
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false },
-    connectionTimeoutMillis: 10000, // 10 segundos de margen
-    idleTimeoutMillis: 30000,       // Cerrar conexiones inactivas
-    max: 10                         // No saturar la base de datos
+    connectionTimeoutMillis: 10000, 
+    idleTimeoutMillis: 30000,
+    max: 10
 });
 
-// Verificador de conexión al arrancar (para el Log de Render)
 pool.on('error', (err) => {
-    console.error('❌ [POSTGRES] Error inesperado en el pool:', err);
+    console.error('❌ [POSTGRES] Error inesperado en el pool:', err.message);
 });
 
 exports.login = async (req, res) => {
     const { email, password, fleetCode } = req.body;
     let driver = null;
 
-    console.log(`[INFO] Intentando login para: ${email || fleetCode} [TxID: ${req.correlationId}]`);
+    // Usamos el ID de correlación para rastrear la petición en los logs
+    const txId = req.correlationId || 'N/A';
+    console.log(`[INFO] [TxID: ${txId}] Intento de login: ${email || fleetCode}`);
 
     try {
         if (email && password) {
-            // BUSQUEDA POR EMAIL (Autónomos)
             const result = await pool.query(
                 'SELECT * FROM drivers WHERE email = $1 AND password = $2',
                 [email, password]
             );
             driver = result.rows[0];
         } else if (fleetCode) {
-            // BUSQUEDA POR CÓDIGO DE FLOTA (Empresas)
             const result = await pool.query(
                 'SELECT * FROM drivers WHERE fleet_code = $1',
                 [fleetCode]
@@ -39,20 +45,19 @@ exports.login = async (req, res) => {
         }
 
         if (!driver) {
-            console.warn(`[WARN] Credenciales fallidas para: ${email || fleetCode}`);
+            console.warn(`[WARN] [TxID: ${txId}] Credenciales incorrectas.`);
             return res.status(401).json({ success: false, error: 'Credenciales incorrectas' });
         }
 
-        // Generamos el Token JWT de seguridad
+        // 🔐 TU LLAVE MAESTRA REAL APLICADA AQUÍ
         const token = jwt.sign(
             { id: driver.id, role: driver.fleet_code ? 'fleet' : 'individual' },
-            process.env.JWT_SECRET || 'trucknav_secret_2026',
+            process.env.JWT_SECRET || 'TrUcKnAv_s3cr3t0_m43str0_2026_super_seguro',
             { expiresIn: '2h' }
         );
 
-        console.log(`[OK] Login exitoso para ID: ${driver.id}`);
+        console.log(`[OK] [TxID: ${txId}] Login exitoso para el conductor ID: ${driver.id}`);
 
-        // Devolvemos la respuesta para Android (con limpieza de números)
         res.json({
             success: true,
             token: token,
@@ -63,10 +68,10 @@ exports.login = async (req, res) => {
         });
 
     } catch (err) {
-        console.error('❌ [ERROR FATAL] PostgreSQL:', err.message);
+        console.error(`❌ [ERROR FATAL] [TxID: ${txId}] PostgreSQL:`, err.message);
         res.status(500).json({ 
             success: false, 
-            error: 'Error de conexión con la Central. Reinténtalo en unos segundos.' 
+            error: 'La Central no responde. Reintenta en unos segundos.' 
         });
     }
 };
