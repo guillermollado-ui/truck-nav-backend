@@ -11,24 +11,33 @@ const hazardController = require('../controllers/hazardController');
 // 🔥 NUEVO: Importamos el cerebro de autenticación que conectamos a PostgreSQL
 const authController = require('../controllers/authController');
 
-// Taquilla
+// --- SECCIÓN: IDENTIDAD & ACCESO ---
+
+// Taquilla (API Key para flotas externas)
 router.post('/auth/token', generateToken);
 
-// 🔥 NUEVO: La puerta de entrada para el móvil (B2B Login)
+// Puerta de entrada para el móvil (B2B Login)
 router.post('/auth/login', authController.login);
 
-// Vehículos & Reglas
+// 🔥 DÍA 59: Actualizar perfil del camión (Altura, Peso, ADR)
+// Nota: Usa 'authenticateJWT' para saber qué conductor está haciendo el cambio
+router.put('/auth/profile', authenticateJWT, authController.updateProfile);
+
+
+// --- SECCIÓN: VEHÍCULOS & REGLAS ---
 router.get('/vehicles', authenticateJWT, vehicleController.getVehicles);
 router.post('/vehicles', authenticateJWT, validateVehicleByCountry, vehicleController.createVehicleSnapshot);
 router.get('/rules/:country_code', authenticateJWT, vehicleController.getCountryRules);
 router.get('/zones/:country_code', authenticateJWT, vehicleController.getZones);
 
-// Rutas & Auditoría
+
+// --- SECCIÓN: RUTAS & AUDITORÍA ---
 router.post('/route', authenticateJWT, routeController.calculateRoute);
 router.get('/route/:id', authenticateJWT, routeController.getRouteMaster);
 router.get('/legal/audit/:response_id', authenticateJWT, routeController.getAudit);
 
-// Sesiones (Tacógrafo)
+
+// --- SECCIÓN: SESIONES (TACÓGRAFO) ---
 router.post('/sessions/start', authenticateJWT, sessionController.startSession);
 router.post('/sessions/stop', authenticateJWT, sessionController.stopSession);
 router.get('/sessions/status', authenticateJWT, sessionController.getStatus);
@@ -39,7 +48,8 @@ router.post('/sessions/rest/start', authenticateJWT, sessionController.startRest
 router.post('/sessions/rest/stop', authenticateJWT, sessionController.stopRest);
 router.get('/sessions/hud', authenticateJWT, sessionController.getHud);
 
-// Inteligencia de Carretera (Mente Colmena)
+
+// --- SECCIÓN: INTELIGENCIA DE CARRETERA (MENTE COLMENA) ---
 router.post('/hazards/report', authenticateJWT, hazardController.reportHazard);
 router.get('/hazards/nearby', authenticateJWT, hazardController.getNearbyHazards);
 
