@@ -1,8 +1,8 @@
 // Archivo: src/controllers/authController.js
-// 🔥 CAMBIO DE RUTA: Subimos a src (..) y entramos en config (/config/db)
 const pool = require('../config/db'); 
 const jwt = require('jsonwebtoken');
 
+// --- FUNCIÓN 1: LOGIN ---
 exports.login = async (req, res) => {
     const { email, password, fleetCode } = req.body;
     let driver = null;
@@ -54,11 +54,14 @@ exports.login = async (req, res) => {
             error: 'La Central no responde. Reintenta en unos segundos.' 
         });
     }
-// ... (lo que ya teníamos de login)
+}; // <--- Aquí estaba el fallo, faltaba cerrar la función login.
 
+// --- FUNCIÓN 2: ACTUALIZAR PERFIL (DÍA 59) ---
 exports.updateProfile = async (req, res) => {
     const { truck_height, truck_weight, is_adr } = req.body;
-    const driverId = req.user.id; // Obtenido del token JWT por el middleware
+    
+    // El ID viene del Token gracias al middleware authenticateJWT
+    const driverId = req.user.id; 
 
     const txId = req.correlationId || 'N/A';
     console.log(`[INFO] [TxID: ${txId}] Actualizando perfil para ID: ${driverId}`);
