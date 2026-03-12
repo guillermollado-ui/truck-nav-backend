@@ -8,9 +8,14 @@ const routeController = require('../controllers/routeController');
 const sessionController = require('../controllers/sessionController');
 const vehicleController = require('../controllers/vehicleController');
 const hazardController = require('../controllers/hazardController');
+// 🔥 NUEVO: Importamos el cerebro de autenticación que conectamos a PostgreSQL
+const authController = require('../controllers/authController');
 
 // Taquilla
 router.post('/auth/token', generateToken);
+
+// 🔥 NUEVO: La puerta de entrada para el móvil (B2B Login)
+router.post('/auth/login', authController.login);
 
 // Vehículos & Reglas
 router.get('/vehicles', authenticateJWT, vehicleController.getVehicles);
