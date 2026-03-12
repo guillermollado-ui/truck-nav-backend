@@ -1,5 +1,6 @@
-// 💡 IMPORTANTE: Importamos el pool del archivo anterior (ajusta la ruta si es necesario)
-const pool = require('../db'); 
+// Archivo: src/controllers/authController.js
+// 🔥 CAMBIO DE RUTA: Subimos a src (..) y entramos en config (/config/db)
+const pool = require('../config/db'); 
 const jwt = require('jsonwebtoken');
 
 exports.login = async (req, res) => {
@@ -7,18 +8,16 @@ exports.login = async (req, res) => {
     let driver = null;
 
     const txId = req.correlationId || 'N/A';
-    console.log(`[INFO] [TxID: ${txId}] Intento de login: ${email || fleetCode}`);
+    console.log(`[INFO] [TxID: ${txId}] Intento de login para: ${email || fleetCode}`);
 
     try {
         if (email && password) {
-            // BUSQUEDA POR EMAIL (Autónomos)
             const result = await pool.query(
                 'SELECT * FROM drivers WHERE email = $1 AND password = $2',
                 [email, password]
             );
             driver = result.rows[0];
         } else if (fleetCode) {
-            // BUSQUEDA POR CÓDIGO DE FLOTA (Empresas)
             const result = await pool.query(
                 'SELECT * FROM drivers WHERE fleet_code = $1',
                 [fleetCode]
@@ -31,7 +30,6 @@ exports.login = async (req, res) => {
             return res.status(401).json({ success: false, error: 'Credenciales incorrectas' });
         }
 
-        // 🔐 TU LLAVE MAESTRA REAL
         const token = jwt.sign(
             { id: driver.id, role: driver.fleet_code ? 'fleet' : 'individual' },
             process.env.JWT_SECRET || 'TrUcKnAv_s3cr3t0_m43str0_2026_super_seguro',
