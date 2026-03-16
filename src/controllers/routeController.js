@@ -52,6 +52,9 @@ exports.calculateRoute = async (req, res, next) => {
         let interceptCoords = null; 
         let isViable = true;
         let totalRisk = 0;
+        
+        // 🔥 NUEVO: Array para capturar la geometría de HERE
+        let routePolylines = []; 
 
         if (routeData.routes && routeData.routes.length > 0) {
             const sections = routeData.routes[0].sections;
@@ -59,6 +62,10 @@ exports.calculateRoute = async (req, res, next) => {
                 accDuration += sections[i].summary?.duration || 0;
                 if (timeLimit > 0 && accDuration >= timeLimit && !interceptCoords) {
                     interceptCoords = `${sections[i].arrival?.place?.location?.lat},${sections[i].arrival?.place?.location?.lng}`; 
+                }
+                // 🔥 NUEVO: Extraer la polilínea codificada de esta sección
+                if (sections[i].polyline) {
+                    routePolylines.push(sections[i].polyline);
                 }
             }
         }
@@ -151,7 +158,10 @@ exports.calculateRoute = async (req, res, next) => {
             suggested_parkings: parkings, 
             hazards_on_route: routeHazards, 
             final_route_risk: totalRisk, 
-            hash: decisionHash 
+            hash: decisionHash,
+            // 🔥 NUEVO: Añadimos la geometría para el dibujo y las maniobras para la voz
+            route_polylines: routePolylines,
+            raw_route_data: routeData.routes && routeData.routes.length > 0 ? routeData.routes[0] : null
         });
     } catch (error) { next(error); }
 };
