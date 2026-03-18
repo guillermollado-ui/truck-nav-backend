@@ -1,7 +1,7 @@
 const pool = require('../config/db');
 const crypto = require('crypto');
 const { sortJSON } = require('../utils/helpers');
-const { fetchRouteFromHEREWithRetry } = require('../services/hereService');
+const { fetchRouteFromMapboxWithRetry } = require('../services/mapboxService');
 const { findSafeParkings } = require('../services/parkingService');
 const { getCache, setCache } = require('../services/cacheService'); 
 
@@ -33,21 +33,21 @@ exports.calculateRoute = async (req, res, next) => {
         let routeData;
 
         // TURBO REDIS CACHE
-        const cachedRoute = await getCache(`route_here_${routeKey}`);
+        const cachedRoute = await getCache(`route_mapbox_${routeKey}`);
         if (cachedRoute) {
-            console.log(`[INFO] [TxID: ${txId}] ⚡ Ruta recuperada de la RAM (Cache).`);
+            console.log(`[INFO] [TxID: ${txId}] ⚡ Ruta recuperada de la RAM (Cache Mapbox).`);
             routeData = cachedRoute;
         } else {
-            console.log(`[DEBUG] [TxID: ${txId}] Buscando en DB o consultando HERE...`);
+            console.log(`[DEBUG] [TxID: ${txId}] Buscando en DB o consultando Mapbox...`);
             const dbCacheResult = await pool.query('SELECT raw_response FROM route_cache WHERE route_key = $1', [routeKey]);
             if (dbCacheResult.rowCount > 0) { 
                 routeData = dbCacheResult.rows[0].raw_response; 
-                await setCache(`route_here_${routeKey}`, routeData); 
+                await setCache(`route_mapbox_${routeKey}`, routeData); 
             } else {
-                console.log(`[INFO] [TxID: ${txId}] 📡 Llamando a HERE API con reintentos...`);
-                routeData = await fetchRouteFromHEREWithRetry(origin, destination, vData);
+                console.log(`[INFO] [TxID: ${txId}] 📡 Llamando a Mapbox Navigation API con reintentos...`);
+                routeData = await fetchRouteFromMapboxWithRetry(origin, destination, vData);
                 await pool.query('INSERT INTO route_cache (route_key, raw_response) VALUES ($1, $2) ON CONFLICT DO NOTHING', [routeKey, routeData]);
-                await setCache(`route_here_${routeKey}`, routeData); 
+                await setCache(`route_mapbox_${routeKey}`, routeData); 
             }
         }
         
@@ -62,16 +62,25 @@ exports.calculateRoute = async (req, res, next) => {
         let routePolylines = []; 
 
         if (routeData.routes && routeData.routes.length > 0) {
-            const sections = routeData.routes[0].sections;
-            console.log(`[DEBUG] [TxID: ${txId}] Procesando ${sections.length} secciones de la ruta.`);
-            for (let i = 0; i < sections.length; i++) {
-                accDuration += sections[i].summary?.duration || 0;
-                if (timeLimit > 0 && accDuration >= timeLimit && !interceptCoords) {
-                    interceptCoords = `${sections[i].arrival?.place?.location?.lat},${sections[i].arrival?.place?.location?.lng}`; 
-                    console.log(`[DEBUG] [TxID: ${txId}] Punto de intercepción legal detectado en: ${interceptCoords}`);
-                }
-                if (sections[i].polyline) {
-                    routePolylines.push(sections[i].polyline);
+            const legs = routeData.routes[0].legs || [];
+            console.log(`[DEBUG] [TxID: ${txId}] Procesando ${legs.length} tramos (legs) de la ruta de Mapbox.`);
+            
+            // Mapbox trae una geometría global por ruta
+            if (routeData.routes[0].geometry) {
+                routePolylines.push(routeData.routes[0].geometry);
+            }
+
+            for (let i = 0; i < legs.length; i++) {
+                // Iteramos por los steps para mayor precisión en el punto de intercepción
+                const steps = legs[i].steps || [];
+                for (let j = 0; j < steps.length; j++) {
+                    accDuration += steps[j].duration || 0;
+                    if (timeLimit > 0 && accDuration >= timeLimit && !interceptCoords) {
+                        // Mapbox usa [lon, lat] en maneuver.location
+                        const loc = steps[j].maneuver.location; 
+                        interceptCoords = `${loc[1]},${loc[0]}`; 
+                        console.log(`[DEBUG] [TxID: ${txId}] Punto de intercepción legal detectado en: ${interceptCoords}`);
+                    }
                 }
             }
         }
@@ -153,7 +162,8 @@ exports.calculateRoute = async (req, res, next) => {
             final_route_risk: totalRisk, 
             hash: decisionHash,
             route_polylines: routePolylines,
-            raw_route_data: routeData.routes && routeData.routes.length > 0 ? routeData.routes[0] : null
+            raw_route_data: routeData.routes && routeData.routes.length > 0 ? routeData.routes[0] : null,
+            full_mapbox_response: routeData // 🎁 Añadido extra para que el SDK de Android tenga todo el objeto JSON original por si lo necesita
         });
 
     } catch (error) { 
