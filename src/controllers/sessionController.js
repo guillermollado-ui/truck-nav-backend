@@ -85,32 +85,33 @@ exports.telemetry = async (req, res, next) => {
         }
 
         // ==========================================
-        // DÍA 43, 44 Y 45: MINERÍA PASIVA Y CONSENSO
+        // 🔥 PUNTO 2: DETECCIÓN AUTOMÁTICA DE HAZARDS (CLUSTERING 30m) 🔥
         // ==========================================
         let autoHazardCreated = false;
         if (prevSpeed !== undefined && lat && lon) {
             const speedDrop = prevSpeed - currentSpeed;
-            if (speedDrop >= 20) {
+            if (speedDrop >= 20) { // Caída brusca de velocidad = Frenazo
                 const confidenceAdded = 15;
                 
-                // Búsqueda espacial de un frenazo previo en 100 metros
+                // Búsqueda espacial estricta a 30 metros (Clustering preciso)
                 const searchCmd = `
-                    SELECT id, confidence_score, report_count
+                    SELECT id, confidence_score, COALESCE(report_count, 0) as report_count
                     FROM hazard_candidates
                     WHERE type = 'brake_hotspot'
-                    AND ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography, 100)
+                    AND ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography, 30)
                     AND last_seen > CURRENT_TIMESTAMP - INTERVAL '24 hours'
                     FOR UPDATE
                 `;
                 const searchRes = await client.query(searchCmd, [lat, lon]);
 
                 if (searchRes.rowCount > 0) {
-                    // Ya existía un frenazo aquí. ¡Fusionamos!
+                    // Ya existía un frenazo aquí a menos de 30m. ¡Agrupamos!
                     const existing = searchRes.rows[0];
                     const newScore = existing.confidence_score + confidenceAdded;
-                    const newCount = existing.report_count + 1;
+                    const newCount = existing.report_count + 1; // Sumamos un evento más
                     let newStatus = 'unverified';
 
+                    // Si 3 camiones frenan en los mismos 30m, se autoverifica el peligro
                     if (newCount >= 3 || newScore >= 60) newStatus = 'verified_hazard';
                     else if (newScore >= 30) newStatus = 'probable';
 
@@ -119,15 +120,15 @@ exports.telemetry = async (req, res, next) => {
                         SET confidence_score = $1, report_count = $2, status = $3, last_seen = CURRENT_TIMESTAMP
                         WHERE id = $4
                     `, [newScore, newCount, newStatus, existing.id]);
-                    console.log(`[INFO] [TxID: ${req.correlationId}] 🤝 Consenso Pasivo: Atasco en ${lat},${lon} sube a score ${newScore}. Status: ${newStatus}`);
+                    console.log(`[INFO] [TxID: ${req.correlationId}] 🤝 Cluster de Frenado: Atasco en ${lat},${lon} agrupado. Total eventos: ${newCount}. Status: ${newStatus}`);
                 } else {
-                    // Primer frenazo en esta zona
+                    // Primer frenazo detectado en esta zona, inicializamos el contador a 1
                     const insertCmd = `
-                        INSERT INTO hazard_candidates (lat, lon, geom, type, source, confidence_score, status)
-                        VALUES ($1, $2, ST_SetSRID(ST_MakePoint($2, $1), 4326), 'brake_hotspot', 'auto_braking', $3, 'unverified')
+                        INSERT INTO hazard_candidates (lat, lon, geom, type, source, confidence_score, status, report_count)
+                        VALUES ($1, $2, ST_SetSRID(ST_MakePoint($2, $1), 4326), 'brake_hotspot', 'auto_braking', $3, 'unverified', 1)
                     `;
                     await client.query(insertCmd, [lat, lon, confidenceAdded]);
-                    console.log(`[INFO] [TxID: ${req.correlationId}] 🚨 AUTO-FRENADO DETECTADO: Nuevo punto caliente creado en ${lat},${lon}`);
+                    console.log(`[INFO] [TxID: ${req.correlationId}] 🚨 AUTO-FRENADO DETECTADO: Nuevo clúster creado en ${lat},${lon}`);
                 }
                 autoHazardCreated = true;
             }
