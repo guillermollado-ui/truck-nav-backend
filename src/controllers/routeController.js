@@ -29,7 +29,23 @@ exports.calculateRoute = async (req, res, next) => {
         }
 
         let timeLimit = Math.min(contRem, dailyRem);
-        const routeKey = crypto.createHash('sha256').update(`${origin}_${destination}_${vData.height_m}_${vData.weight_t}_${vData.euro_standard}`).digest('hex');
+
+        // ==========================================
+        // 🔥 SOLUCIÓN AL FANTASMA DEL CACHE: REDONDEO DE SEGURIDAD 🔥
+        // ==========================================
+        const roundCoord = (coordStr) => {
+            if (!coordStr || !coordStr.includes(',')) return coordStr;
+            return coordStr.split(',').map(n => parseFloat(n).toFixed(4)).join(',');
+        };
+
+        const cleanOrigin = roundCoord(origin);
+        const cleanDest = roundCoord(destination);
+
+        // Generamos el Hash usando las coordenadas redondeadas
+        const routeKey = crypto.createHash('sha256')
+            .update(`${cleanOrigin}_${cleanDest}_${vData.height_m}_${vData.weight_t}_${vData.euro_standard}`)
+            .digest('hex');
+        
         let routeData;
 
         // TURBO REDIS CACHE
@@ -157,7 +173,7 @@ exports.calculateRoute = async (req, res, next) => {
             message: isViable ? 'Ruta sellada.' : 'Ruta BLOQUEADA.', 
             legal_warning: warning, 
             intercept_point_coords: interceptCoords, 
-            suggested_parkings: parkings, 
+            suggest_parkings: parkings, 
             hazards_on_route: routeHazards, 
             final_route_risk: totalRisk, 
             hash: decisionHash,
