@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+const pool = require('../config/db');
 
 const findSafeParkings = async (coords, forceEmpty = false) => {
     if (!coords || forceEmpty) return []; 
@@ -7,26 +7,36 @@ const findSafeParkings = async (coords, forceEmpty = false) => {
     const lng = parseFloat(parts[1]);
     if (isNaN(lat) || isNaN(lng)) return [];
 
-    return [
-        {
-            id: crypto.randomUUID(),
-            name: "TruckNav Premium SafeHaven",
-            location: `${(lat + 0.015).toFixed(4)},${(lng + 0.010).toFixed(4)}`,
-            security_level: "Gold (CCTV 24/7 + Vallado)",
-            available_spots: 12,
-            amenities: ["Duchas limpias", "Restaurante 24h", "Wifi Alta Velocidad"],
-            distance_to_route_km: 1.2
-        },
-        {
-            id: crypto.randomUUID(),
-            name: "Logistics Rest Area B2B",
-            location: `${(lat - 0.010).toFixed(4)},${(lng - 0.020).toFixed(4)}`,
-            security_level: "Silver (Vigilancia nocturna)",
-            available_spots: 4,
-            amenities: ["Cafetería", "Aseos básicos"],
-            distance_to_route_km: 2.5
-        }
-    ];
+    try {
+        // 🚀 BÚSQUEDA ESPACIAL REAL EN POSTGIS (Radio de 50km desde el punto de intercepción)
+        const query = `
+            SELECT 
+                id, 
+                name, 
+                CONCAT(lat, ',', lon) as location, 
+                security_level, 
+                available_spots, 
+                amenities,
+                ROUND((ST_Distance(geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography) / 1000.0)::numeric, 1) as distance_to_route_km
+            FROM parkings
+            WHERE ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography, 50000)
+            ORDER BY distance_to_route_km ASC
+            LIMIT 3
+        `;
+        
+        const result = await pool.query(query, [lat, lng]);
+        
+        // Transformamos el resultado para asegurar que "amenities" sea un array (por si en PostgreSQL está como JSON/Texto)
+        return result.rows.map(row => ({
+            ...row,
+            amenities: typeof row.amenities === 'string' ? JSON.parse(row.amenities) : (row.amenities || [])
+        }));
+        
+    } catch (error) {
+        console.error(`[ERROR] Fallo al buscar parkings reales en DB para coords ${coords}:`, error.message);
+        // 🛑 MECANISMO DE SEGURIDAD: Si la tabla no existe o hay error, no tumbamos el servidor.
+        return []; 
+    }
 };
 
 module.exports = { findSafeParkings };
